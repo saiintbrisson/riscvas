@@ -631,11 +631,7 @@ mod parser {
 }
 
 mod assembler {
-    use std::{
-        cell::RefCell,
-        collections::{HashMap, HashSet},
-        rc::Rc,
-    };
+    use std::{cell::RefCell, rc::Rc};
 
     use crate::{addi, auipc, bne, elf::reloc::ElfRelocType, jal, lb, lui, sb};
 
@@ -663,27 +659,29 @@ mod assembler {
             .0 as u8
     }
 
-    #[derive(Clone, Copy, Default)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
     pub enum SymbolType {
+        FileLocal,
+        Section,
+        LocalInternal,
+        Local,
+        Global,
         #[default]
         Unknown,
-        FileLocal,
-        Global,
-        Local,
     }
 
-    #[derive(Default)]
+    #[derive(Debug, Default)]
     pub struct Symbol {
+        pub id: usize,
+        pub name: String,
         pub r#type: SymbolType,
-        pub value: Option<usize>,
+        pub value: Option<(String, usize)>,
     }
 
     pub struct Section {
         pub name: String,
         pub buf: Vec<u8>,
-        pub symbols: HashMap<String, Symbol>,
         pub relocs: Vec<Reloc>,
-        pub temporary_label_cursor: usize,
     }
 
     impl Default for Section {
@@ -691,28 +689,22 @@ mod assembler {
             Self {
                 name: ".text".to_string(),
                 buf: Default::default(),
-                symbols: Default::default(),
                 relocs: Default::default(),
-                temporary_label_cursor: 0,
             }
         }
     }
 
     pub struct Reloc {
         pub r#type: ElfRelocType,
-        pub symbol: Option<String>,
+        pub symbol: Option<usize>,
         pub offset: usize,
         pub addend: Option<isize>,
     }
 
     pub struct Assembler {
         items: Vec<TopLevel>,
-        cursor: usize,
 
-        // pub labels: HashMap<String, (String, usize)>,
-        pub global_symbols: HashSet<String>,
-
-        position: usize,
+        pub symbols: Vec<Symbol>,
 
         pub sections: Vec<Rc<RefCell<Section>>>,
         pub open_section: Rc<RefCell<Section>>,
@@ -724,10 +716,8 @@ mod assembler {
 
             Self {
                 items,
-                cursor: Default::default(),
-                // labels: Default::default(),
-                global_symbols: Default::default(),
-                position: Default::default(),
+
+                symbols: Default::default(),
 
                 sections: vec![open_section.clone()],
                 open_section,
@@ -746,9 +736,11 @@ mod assembler {
 
             match &*ident.0.to_lowercase() {
                 "globl" | "global" => {
-                    self.process_symbol(extract_values!(Symbol), SymbolType::Global)
+                    self.process_symbol(extract_values!(Symbol), SymbolType::Global, None);
                 }
-                "local" => self.process_symbol(extract_values!(Symbol), SymbolType::Local),
+                "local" => {
+                    self.process_symbol(extract_values!(Symbol), SymbolType::Local, None);
+                }
                 "string" | "asciz" => self.write(&extract_values!(String)),
 
                 "section" => self.process_section(extract_values!(Symbol)),
@@ -794,23 +786,46 @@ mod assembler {
             }
         }
 
-        fn process_symbol(&mut self, symbol: Identifier, r#type: SymbolType) {
-            let symbol = symbol.0;
+        fn process_symbol(
+            &mut self,
+            symbol: Identifier,
+            r#type: SymbolType,
+            value: Option<(String, usize)>,
+        ) -> usize {
+            let name = symbol.0;
 
-            assert!(
-                self.global_symbols.insert(symbol.clone()),
-                "duplicate global symbol {symbol:?}"
-            );
+            if matches!(r#type, SymbolType::LocalInternal) {
+                self.symbols.push(Symbol {
+                    id: self.symbols.len(),
+                    name: name.clone(),
+                    r#type,
+                    value,
+                });
 
-            let mut section = self.open_section.borrow_mut();
+                return self.symbols.len() - 1;
+            }
 
-            let symbol = section.symbols.entry(symbol).or_default();
-            assert!(
-                matches!(symbol.r#type, SymbolType::Unknown),
-                "symbol already defined"
-            );
+            let Some(sym) = self.symbols.iter_mut().find(|sym| sym.name == name) else {
+                self.symbols.push(Symbol {
+                    id: self.symbols.len(),
+                    name: name.clone(),
+                    r#type,
+                    value,
+                });
 
-            symbol.r#type = r#type;
+                return self.symbols.len() - 1;
+            };
+
+            if value.is_some() && sym.value.is_some() {
+                panic!("duplicate symbol declaration: {:?}", sym.name);
+            }
+
+            if r#type != SymbolType::Unknown {
+                sym.r#type = r#type;
+            }
+            sym.value = sym.value.take().or(value);
+
+            sym.id
         }
 
         fn consume_instruction(&mut self, ident: Identifier, mut exprs: Vec<Expr>) {
@@ -889,12 +904,16 @@ mod assembler {
                 }
                 "bne" => {
                     let (rs1, rs2, sym) = extract!(Reg, Reg, Symbol);
-                    self.process_reloc(ElfRelocType::BRANCH, Some(sym.0), None);
+                    let sym = self.process_symbol(sym, SymbolType::Unknown, None);
+
+                    self.process_reloc(ElfRelocType::BRANCH, Some(sym), None);
                     self.write(&bne(rs1, rs2, 0));
                 }
                 "j" => {
                     let (sym,) = extract!(Symbol);
-                    self.process_reloc(ElfRelocType::JAL, Some(sym.0), None);
+                    let sym = self.process_symbol(sym, SymbolType::Unknown, None);
+
+                    self.process_reloc(ElfRelocType::JAL, Some(sym), None);
                     self.write(&jal(0, 0));
                 }
 
@@ -907,12 +926,14 @@ mod assembler {
                 "lla" => {
                     let (rd,) = extract!(Reg);
                     let (sym, addend) = Self::process_addr(exprs.pop().unwrap());
+                    let sym = self.process_symbol(Identifier(sym), SymbolType::Unknown, None);
 
-                    self.process_reloc(ElfRelocType::PCREL_HI20, Some(sym.clone()), Some(addend));
+                    self.process_reloc(ElfRelocType::PCREL_HI20, Some(sym), Some(addend));
                     self.process_reloc(ElfRelocType::RELAX, None, Some(0));
-                    let name = self.emit_temporary_label();
+                    let local_sym = self.emit_temp_local();
                     self.write(&auipc(rd, 0));
-                    self.process_reloc(ElfRelocType::PCREL_LO12_I, Some(name), Some(addend));
+
+                    self.process_reloc(ElfRelocType::PCREL_LO12_I, Some(local_sym), Some(addend));
                     self.process_reloc(ElfRelocType::RELAX, None, Some(0));
                     self.write(&addi(rd, rd, 0));
                 }
@@ -946,7 +967,7 @@ mod assembler {
         fn process_reloc(
             &mut self,
             reloc: ElfRelocType,
-            symbol: Option<String>,
+            symbol: Option<usize>,
             addend: Option<isize>,
         ) {
             let reloc = Reloc {
@@ -968,30 +989,50 @@ mod assembler {
                 match item {
                     TopLevel::Directive(ident, exprs) => self.consume_directive(ident, exprs),
                     TopLevel::Label(label) => {
-                        let mut section = self.open_section.borrow_mut();
+                        let section = self.open_section.borrow();
+                        let section_name = section.name.clone();
+                        let val = section.buf.len();
+                        drop(section);
                         let label = label.0.clone();
-                        let pos = section.buf.len();
 
-                        let symbol = section.symbols.entry(label).or_default();
-                        assert!(symbol.value.is_none(), "symbol already defined");
-                        symbol.value = Some(pos);
+                        self.process_symbol(
+                            Identifier(label),
+                            SymbolType::Local,
+                            Some((section_name, val)),
+                        );
                     }
                     TopLevel::Instruction(ident, exprs) => self.consume_instruction(ident, exprs),
                 }
             }
+
+            for sec in &self.sections {
+                let sec = sec.borrow();
+                self.symbols.push(Symbol {
+                    id: self.symbols.len(),
+                    name: sec.name.clone(),
+                    r#type: SymbolType::Section,
+                    value: Some((sec.name.clone(), 0)),
+                });
+            }
+
+            for sym in &mut self.symbols {
+                if sym.r#type != SymbolType::Unknown && sym.value.is_none() {
+                    sym.r#type = SymbolType::Unknown;
+                }
+            }
         }
 
-        fn emit_temporary_label(&mut self) -> String {
-            let mut section = self.open_section.borrow_mut();
-            section.temporary_label_cursor += 1;
+        fn emit_temp_local(&mut self) -> usize {
+            let section = self.open_section.borrow();
+            let section_name = section.name.clone();
+            let val = section.buf.len();
+            drop(section);
 
-            let label = format!(".L{}", section.temporary_label_cursor);
-            let pos = section.buf.len();
-            let symbol = section.symbols.entry(label.clone()).or_default();
-            assert!(symbol.value.is_none(), "symbol already defined");
-            symbol.value = Some(pos);
-
-            label
+            self.process_symbol(
+                Identifier(format!(".L0 ",)),
+                SymbolType::LocalInternal,
+                Some((section_name, val)),
+            )
         }
     }
 
@@ -1008,22 +1049,17 @@ mod assembler {
 }
 
 mod elf {
-    use std::{
-        collections::{HashMap, HashSet},
-        ffi::CString,
-        path::{Path, PathBuf},
-    };
+    use std::{collections::HashMap, path::Path};
 
     use bytes::{BufMut, BytesMut};
     use section::SectionHeader;
-    use symbol::{ElfSymbol, SymbolBinding, SymbolType};
+    use symbol::{ElfSymbol, SymbolBinding, SymbolType, SymbolVisibility};
 
     use crate::assembler::Assembler;
 
     struct ElfFile {
         sections: Vec<SectionHeader>,
         symbols: Vec<ElfSymbol>,
-        symbol_index: HashMap<String, usize>,
 
         shstrtab: Vec<u8>,
         strtab: Vec<u8>,
@@ -1034,7 +1070,6 @@ mod elf {
             Self {
                 sections: vec![SectionHeader::default()],
                 symbols: vec![ElfSymbol::default()],
-                symbol_index: HashMap::new(),
                 shstrtab: vec![0],
                 strtab: vec![0],
             }
@@ -1052,8 +1087,6 @@ mod elf {
             self.strtab.put_u8(0u8);
 
             self.symbols.push(sym);
-            self.symbol_index
-                .insert(name.to_string(), self.symbols.len() - 1);
         }
 
         fn add_section_str(&mut self, str: &str) -> usize {
@@ -1296,7 +1329,7 @@ mod elf {
             pub const SHF_TLS: u64 = 0x400;
         }
 
-        #[derive(Debug, Default)]
+        #[derive(Clone, Debug, Default)]
         pub struct SectionHeader {
             pub name: u32,
             pub r#type: SectionType,
@@ -1364,13 +1397,42 @@ mod elf {
             Weak = 2,
         }
 
+        #[repr(u8)]
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+        pub enum SymbolVisibility {
+            /// The visibility of symbols with the STV_DEFAULT attribute
+            /// is as specified by the symbol's binding type. That is,
+            /// global and weak symbols are visible outside of their
+            /// defining component, the executable file or shared object.
+            /// Local symbols are hidden. Global and weak symbols can
+            /// also be preempted, that is, they may by interposed by
+            /// definitions of the same name in another component.
+            #[default]
+            Default = 0,
+            /// A symbol defined in the current component is hidden if
+            /// its name is not visible to other components. Such a
+            /// symbol is necessarily protected. This attribute is used
+            /// to control the external interface of a component. An
+            /// object named by such a symbol may still be referenced
+            /// from another component if its address is passed outside.
+            ///
+            /// A hidden symbol contained in a relocatable object is
+            /// either removed or converted to STB_LOCAL binding by the
+            /// link-editor when the relocatable object is included in an
+            /// executable file or shared object.
+            Hidden = 2,
+        }
+
         impl From<crate::assembler::SymbolType> for SymbolBinding {
             fn from(value: crate::assembler::SymbolType) -> Self {
                 match value {
+                    crate::assembler::SymbolType::FileLocal => todo!(),
+
+                    crate::assembler::SymbolType::Section => Self::Local,
                     crate::assembler::SymbolType::Global => Self::Global,
                     crate::assembler::SymbolType::Local => Self::Local,
-                    crate::assembler::SymbolType::Unknown => Self::Local,
-                    _ => unreachable!(),
+                    crate::assembler::SymbolType::LocalInternal => Self::Local,
+                    crate::assembler::SymbolType::Unknown => Self::Global,
                 }
             }
         }
@@ -1401,8 +1463,51 @@ mod elf {
         let class = elf_header::ElfClass::C32;
         let mut elf_file = ElfFile::new();
 
-        let mut indexes = HashMap::new();
         let mut relocations = vec![];
+
+        let mut section_by_name = HashMap::with_capacity(assembler.sections.len() * 4);
+
+        assembler.symbols.sort_unstable_by_key(|sym| sym.r#type);
+        let symbols_by_id: HashMap<_, _> = assembler
+            .symbols
+            .iter()
+            .enumerate()
+            .map(|(idx, sym)| (sym.id, idx))
+            .collect();
+
+        for sym in &assembler.symbols {
+            let r#type = if sym.r#type == crate::assembler::SymbolType::Section {
+                SymbolType::Section
+            } else {
+                SymbolType::NoType
+            };
+
+            let Some(val) = sym.value.as_ref() else {
+                elf_file.add_symbol(
+                    &sym.name,
+                    ElfSymbol {
+                        info: (r#type, sym.r#type.into()),
+                        ..Default::default()
+                    },
+                );
+                continue;
+            };
+
+            elf_file.add_symbol(
+                &sym.name,
+                ElfSymbol {
+                    value: val.1 as u64,
+                    info: (r#type, sym.r#type.into()),
+                    shndx: assembler
+                        .sections
+                        .iter()
+                        .position(|sec| sec.borrow().name == val.0)
+                        .unwrap() as u16
+                        + 1,
+                    ..Default::default()
+                },
+            );
+        }
 
         for section in &assembler.sections {
             let section = section.borrow();
@@ -1418,37 +1523,22 @@ mod elf {
                 ..Default::default()
             });
 
-            indexes.insert(section.name.clone(), shndx);
-
-            for (symbol, sym) in &section.symbols {
-                elf_file.add_symbol(
-                    &symbol,
-                    ElfSymbol {
-                        value: sym.value.unwrap() as u64,
-                        info: (SymbolType::NoType, SymbolBinding::Global),
-                        // info: (SymbolType::NoType, sym.r#type.into()),
-                        shndx: shndx as u16,
-                        ..Default::default()
-                    },
-                );
-            }
+            section_by_name.insert(section.name.clone(), shndx);
 
             let mut rels = Vec::with_capacity(section.relocs.len());
             let mut relas = Vec::with_capacity(section.relocs.len());
 
             for reloc in &section.relocs {
-                let sym_idx = reloc
-                    .symbol
-                    .as_ref()
-                    .and_then(|s| elf_file.symbol_index.get(s))
-                    .copied()
-                    .unwrap_or_default();
-
                 let list = if reloc.addend.is_some() {
                     &mut relas
                 } else {
                     &mut rels
                 };
+
+                let sym_idx = reloc
+                    .symbol
+                    .and_then(|id| symbols_by_id.get(&id))
+                    .map_or(0, |idx| idx + 1);
 
                 list.push(reloc::ElfRel {
                     info: (reloc.r#type, sym_idx as u64),
@@ -1459,39 +1549,40 @@ mod elf {
 
             if !rels.is_empty() {
                 let n = elf_file.add_section_str(&format!(".rel{}", section.name));
-                elf_file.add_section(SectionHeader {
-                    name: n as u32,
-                    r#type: section::SectionType::Rel,
-                    size: (class.relentsize() * rels.len()) as u64,
-                    entsize: class.relentsize() as u64,
-                    link: (assembler.sections.len() + 4) as u32,
-                    info: shndx as u32,
-                    ..Default::default()
-                });
-                relocations.push(rels);
+                relocations.push((
+                    SectionHeader {
+                        name: n as u32,
+                        r#type: section::SectionType::Rel,
+                        size: (class.relentsize() * rels.len()) as u64,
+                        entsize: class.relentsize() as u64,
+                        info: shndx as u32,
+                        ..Default::default()
+                    },
+                    rels,
+                ));
             }
 
             if !relas.is_empty() {
                 let n = elf_file.add_section_str(&format!(".rela{}", section.name));
-                elf_file.add_section(SectionHeader {
-                    name: n as u32,
-                    r#type: section::SectionType::Rela,
-                    size: (class.relaentsize() * relas.len()) as u64,
-                    link: (assembler.sections.len() + 4) as u32,
-                    entsize: class.relaentsize() as u64,
-                    info: shndx as u32,
-                    ..Default::default()
-                });
-                relocations.push(relas);
+                relocations.push((
+                    SectionHeader {
+                        name: n as u32,
+                        r#type: section::SectionType::Rela,
+                        size: (class.relaentsize() * relas.len()) as u64,
+                        entsize: class.relaentsize() as u64,
+                        info: shndx as u32,
+                        ..Default::default()
+                    },
+                    relas,
+                ));
             }
         }
 
-        // elf_file.symbols.sort_unstable_by_key(|sym| sym.info.1);
         let first_non_local_symbol = elf_file
             .symbols
             .iter()
             .position(|sym| sym.info.1 != SymbolBinding::Local)
-            .unwrap_or_default();
+            .unwrap_or(elf_file.symbols.len());
 
         let strtab = elf_file.add_section_str(".strtab") as u32;
         let strtab = elf_file.add_section(SectionHeader {
@@ -1503,7 +1594,7 @@ mod elf {
         });
 
         let symtab = elf_file.add_section_str(".symtab") as u32;
-        elf_file.add_section(SectionHeader {
+        let symtab = elf_file.add_section(SectionHeader {
             name: symtab,
             r#type: section::SectionType::Symtab,
             size: (elf_file.symbols.len() * class.symsize()) as u64,
@@ -1512,6 +1603,11 @@ mod elf {
             info: first_non_local_symbol as u32,
             ..Default::default()
         });
+
+        for (sh, _) in &mut relocations {
+            sh.link = symtab as u32;
+            elf_file.add_section(sh.clone());
+        }
 
         let shstrtab = elf_file.add_section_str(".shstrtab") as u32;
         let shstrndx = elf_file.add_section(SectionHeader {
@@ -1558,16 +1654,18 @@ mod elf {
             buf.put_slice(&section.buf);
         }
 
-        for relocations in &relocations {
+        buf.put_slice(&elf_file.strtab);
+
+        for sym in &elf_file.symbols {
+            write_symbol(&mut buf, elf_header.class, sym);
+        }
+
+        for (_, relocations) in &relocations {
             for reloc in relocations {
                 write_relocation(&mut buf, class, reloc);
             }
         }
 
-        buf.put_slice(&elf_file.strtab);
-        for sym in &elf_file.symbols {
-            write_symbol(&mut buf, elf_header.class, sym);
-        }
         buf.put_slice(&elf_file.shstrtab);
 
         let out = Path::new(&std::env::args().nth(2).unwrap()).to_path_buf();
