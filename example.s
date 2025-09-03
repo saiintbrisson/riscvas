@@ -10,8 +10,8 @@ print:
     sb a2, (a0)
     addi a1, a1, 1
     lb a2, (a1)
-    bne a2, zero, print
+    bnez a2, print
 exit:
     j exit
 
-hello_world:    .string "Hello, World!\0"
+hello_world: .string "Hello, World!\n\0"

@@ -140,6 +140,8 @@ type QUADWORD = u128;
 mod lexer {
     use std::iter::Peekable;
 
+    pub type Lexeme = ecow::EcoString;
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum TokenType {
         Comma,
@@ -207,18 +209,19 @@ mod lexer {
             None
         }
 
-        pub fn run(mut self) -> Vec<(TokenType, String)> {
+        pub fn run(mut self) -> Vec<(TokenType, Lexeme)> {
             let mut iter = self.file.char_indices().peekable();
             let mut tokens = Vec::new();
 
             while let Some((idx, c)) = iter.next() {
                 let token = match c {
-                    ',' => (TokenType::Comma, c.to_string()),
-                    ':' => (TokenType::Colon, c.to_string()),
-                    '-' => (TokenType::Hyphen, c.to_string()),
-                    '+' => (TokenType::Plus, c.to_string()),
-                    '(' => (TokenType::LParen, c.to_string()),
-                    ')' => (TokenType::RParen, c.to_string()),
+                    ',' => (TokenType::Comma, c.into()),
+                    ':' => (TokenType::Colon, c.into()),
+                    '-' => (TokenType::Hyphen, c.into()),
+                    '+' => (TokenType::Plus, c.into()),
+                    '(' => (TokenType::LParen, c.into()),
+                    ')' => (TokenType::RParen, c.into()),
+                    '\n' => (TokenType::NewLine, c.into()),
                     '"' => {
                         let mut escaping = false;
                         let end = iter
@@ -234,14 +237,12 @@ mod lexer {
                             })
                             .expect("unclosed string")
                             .0;
-                        let lexeme = &self.file[idx..=end];
-                        (TokenType::String, lexeme.to_string())
+                        (TokenType::String, self.file[idx..=end].into())
                     }
                     '#' => {
                         let _ = self.take_while(&mut iter, |c| c != '\n');
                         continue;
                     }
-                    '\n' => (TokenType::NewLine, c.to_string()),
                     c if c.is_whitespace() => continue,
                     _ => {
                         let mut expect_integer_type = c == '0';
@@ -282,11 +283,11 @@ mod lexer {
                         } else {
                             TokenType::Identifier
                         };
-                        let lexeme = &self.file[idx..=end];
 
-                        (r#type, lexeme.to_string())
+                        (r#type, self.file[idx..=end].into())
                     }
                 };
+
                 tokens.push(token);
             }
 
@@ -321,41 +322,68 @@ mod lexer {
 }
 
 mod parser {
+    use std::ops::{Deref, DerefMut};
+
+    use ecow::EcoString;
+
+    use crate::lexer::Lexeme;
+
     use super::lexer::TokenType;
 
-    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct Identifier(pub String);
-    impl From<&str> for Identifier {
+    #[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct Ident(Lexeme);
+
+    impl Ident {
+        pub const fn new_inline(s: &str) -> Self {
+            Self(Lexeme::inline(s))
+        }
+    }
+
+    impl From<&str> for Ident {
         fn from(value: &str) -> Self {
             Self(value.into())
         }
     }
 
-    impl std::fmt::Debug for Identifier {
+    impl std::fmt::Debug for Ident {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_fmt(format_args!("{}", self.0))
+            f.write_fmt(format_args!("Ident({self})"))
         }
     }
 
-    impl std::fmt::Display for Identifier {
+    impl std::fmt::Display for Ident {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_fmt(format_args!("{}", self.0))
+            f.write_str(&self.0)
+        }
+    }
+
+    impl Deref for Ident {
+        type Target = EcoString;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl DerefMut for Ident {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
         }
     }
 
     #[derive(Debug, Clone)]
     pub enum TopLevel {
-        Directive(Identifier, Vec<Expr>),
-        Label(Identifier),
-        Instruction(Identifier, Vec<Expr>),
+        Directive(Ident, Vec<Expr>),
+        Label(Ident),
+        Instruction(Ident, Vec<Expr>),
     }
 
     #[derive(Clone)]
     pub enum Expr {
         String(Vec<u8>),
         Number(isize),
-        Symbol(Identifier),
-        RelocFunction(Identifier, Box<Expr>),
+        Symbol(Ident),
+        RelocFunction(Ident, Box<Expr>),
         Deref(Box<Expr>),
         App(Box<Expr>, Box<Expr>),
         BinOp(Box<Expr>, OperationType, Box<Expr>),
@@ -418,12 +446,12 @@ mod parser {
     }
 
     pub struct Parser {
-        tokens: Vec<(TokenType, String)>,
+        tokens: Vec<(TokenType, Lexeme)>,
         cursor: usize,
     }
 
     impl Parser {
-        pub fn new(tokens: Vec<(TokenType, String)>) -> Self {
+        pub fn new(tokens: Vec<(TokenType, Lexeme)>) -> Self {
             Self { tokens, cursor: 0 }
         }
 
@@ -434,12 +462,13 @@ mod parser {
                 .unwrap_or(TokenType::Eof)
         }
 
-        fn step(&mut self) -> (TokenType, &str) {
+        fn step(&mut self) -> (TokenType, &Lexeme) {
+            static EMPTY: Lexeme = Lexeme::inline("");
             if let Some(token) = self.tokens.get(self.cursor) {
                 self.cursor += 1;
                 (token.0, &token.1)
             } else {
-                (TokenType::Eof, "")
+                (TokenType::Eof, &EMPTY)
             }
         }
 
@@ -447,7 +476,7 @@ mod parser {
             self.peek() == token
         }
 
-        fn eat(&mut self, token: TokenType) -> Option<&str> {
+        fn eat(&mut self, token: TokenType) -> Option<&Lexeme> {
             if self.is(token) {
                 Some(self.step().1)
             } else {
@@ -471,20 +500,17 @@ mod parser {
         }
 
         fn parse_token(&mut self) -> TopLevel {
-            let identifier = self.eat(TokenType::Identifier).unwrap().to_string();
+            let identifier = self.eat(TokenType::Identifier).unwrap().clone();
 
             if self.eat(TokenType::Colon).is_some() {
-                return TopLevel::Label(Identifier(identifier));
+                return TopLevel::Label(Ident(identifier));
             }
 
             let args = self.parse_list();
             if identifier.starts_with('.') {
-                TopLevel::Directive(
-                    Identifier(identifier.trim_start_matches('.').to_string()),
-                    args,
-                )
+                TopLevel::Directive(Ident(identifier.trim_start_matches('.').into()), args)
             } else {
-                TopLevel::Instruction(Identifier(identifier), args)
+                TopLevel::Instruction(Ident(identifier), args)
             }
         }
 
@@ -542,7 +568,7 @@ mod parser {
                 Expr::Number(isize::from_str_radix(int, radix).unwrap())
             } else if let Some(ident) = self.eat(TokenType::Identifier) {
                 if ident.starts_with('%') {
-                    let func_name = Identifier((&ident[1..]).to_string());
+                    let func_name = Ident((&ident[1..]).into());
 
                     self.eat(TokenType::LParen).expect("invalid function call");
                     let val = self.parse_value().expect("call must have a parameter");
@@ -550,7 +576,7 @@ mod parser {
 
                     Expr::RelocFunction(func_name, Box::new(val))
                 } else {
-                    Expr::Symbol(Identifier(ident.to_string()))
+                    Expr::Symbol(Ident(ident.into()))
                 }
             } else if let Some(fo) = self.eat(TokenType::String) {
                 let string = fo.get(1..fo.len() - 1).unwrap_or_default().to_string();
@@ -561,6 +587,10 @@ mod parser {
                         '0'..'9' if escaping => {
                             escaping = false;
                             buf.push(c as u8 - '0' as u8);
+                        }
+                        'n' if escaping => {
+                            escaping = false;
+                            buf.push('\n' as u8);
                         }
                         c if escaping => panic!("unexpected escaped character {c:?}"),
                         '\\' => escaping = true,
@@ -637,10 +667,10 @@ mod assembler {
 
     use super::{
         Reg,
-        parser::{Expr, Identifier, OperationType, TopLevel},
+        parser::{Expr, Ident, OperationType, TopLevel},
     };
 
-    fn bundareg(mut reg: &str) -> Reg {
+    fn register_from_name(mut reg: &str) -> Reg {
         const REGISTERS: &[&str] = &[
             "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1", "a2", "a3",
             "a4", "a5", "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
@@ -673,13 +703,13 @@ mod assembler {
     #[derive(Debug, Default)]
     pub struct Symbol {
         pub id: usize,
-        pub name: String,
+        pub name: Ident,
         pub r#type: SymbolType,
-        pub value: Option<(String, usize)>,
+        pub value: Option<(Ident, usize)>,
     }
 
     pub struct Section {
-        pub name: String,
+        pub name: Ident,
         pub buf: Vec<u8>,
         pub relocs: Vec<Reloc>,
     }
@@ -687,7 +717,7 @@ mod assembler {
     impl Default for Section {
         fn default() -> Self {
             Self {
-                name: ".text".to_string(),
+                name: ".text".into(),
                 buf: Default::default(),
                 relocs: Default::default(),
             }
@@ -724,7 +754,7 @@ mod assembler {
             }
         }
 
-        fn consume_directive(&mut self, ident: Identifier, mut exprs: Vec<Expr>) {
+        fn consume_directive(&mut self, mut ident: Ident, mut exprs: Vec<Expr>) {
             macro_rules! extract_values {
                 ($($ty:ident),+) => {
                     $(match exprs.pop().unwrap() {
@@ -734,12 +764,13 @@ mod assembler {
                 };
             }
 
-            match &*ident.0.to_lowercase() {
+            ident.make_mut().make_ascii_lowercase();
+            match ident.as_str() {
                 "globl" | "global" => {
-                    self.process_symbol(extract_values!(Symbol), SymbolType::Global, None);
+                    self.emit_symbol(extract_values!(Symbol), SymbolType::Global, None);
                 }
                 "local" => {
-                    self.process_symbol(extract_values!(Symbol), SymbolType::Local, None);
+                    self.emit_symbol(extract_values!(Symbol), SymbolType::Local, None);
                 }
                 "string" | "asciz" => self.write(&extract_values!(String)),
 
@@ -767,9 +798,7 @@ mod assembler {
             };
         }
 
-        fn process_section(&mut self, section_name: Identifier) {
-            let section_name = section_name.0;
-
+        fn process_section(&mut self, section_name: Ident) {
             if let Some(section) = self
                 .sections
                 .iter()
@@ -786,14 +815,12 @@ mod assembler {
             }
         }
 
-        fn process_symbol(
+        fn emit_symbol(
             &mut self,
-            symbol: Identifier,
+            name: Ident,
             r#type: SymbolType,
-            value: Option<(String, usize)>,
+            value: Option<(Ident, usize)>,
         ) -> usize {
-            let name = symbol.0;
-
             if matches!(r#type, SymbolType::LocalInternal) {
                 self.symbols.push(Symbol {
                     id: self.symbols.len(),
@@ -823,16 +850,19 @@ mod assembler {
             if r#type != SymbolType::Unknown {
                 sym.r#type = r#type;
             }
-            sym.value = sym.value.take().or(value);
+
+            if value.is_some() {
+                sym.value = sym.value.take().or(value);
+            }
 
             sym.id
         }
 
-        fn consume_instruction(&mut self, ident: Identifier, mut exprs: Vec<Expr>) {
+        fn consume_instruction(&mut self, mut ident: Ident, mut exprs: Vec<Expr>) {
             macro_rules! extract {
                 (v: Reg) => {
                     match exprs.remove(0) {
-                        Expr::Symbol(arg0) => bundareg(&arg0.0),
+                        Expr::Symbol(arg0) => register_from_name(&arg0),
                         r => panic!("unexpected {r:?}, expected Reg"),
                     }
                 };
@@ -847,7 +877,8 @@ mod assembler {
                 };
             }
 
-            match &*ident.0.to_lowercase() {
+            ident.make_mut().make_ascii_lowercase();
+            match ident.as_str() {
                 "addi" => {
                     let (rd, rs, n) = extract!(Reg, Reg, Number);
                     self.write(&addi(rd, rs, n as u16));
@@ -871,7 +902,7 @@ mod assembler {
                         },
                         _ => panic!(),
                     };
-                    let dst = bundareg(&dst.0);
+                    let dst = register_from_name(&dst);
 
                     self.write(&sb(src, dst, offset as u16));
                 }
@@ -890,7 +921,7 @@ mod assembler {
                         },
                         _ => panic!(),
                     };
-                    let src = bundareg(&src.0);
+                    let src = register_from_name(&src);
 
                     self.write(&lb(rd, src, offset as u16));
                 }
@@ -904,16 +935,16 @@ mod assembler {
                 }
                 "bne" => {
                     let (rs1, rs2, sym) = extract!(Reg, Reg, Symbol);
-                    let sym = self.process_symbol(sym, SymbolType::Unknown, None);
+                    let sym = self.emit_symbol(sym, SymbolType::Unknown, None);
 
-                    self.process_reloc(ElfRelocType::BRANCH, Some(sym), None);
+                    self.emit_relocation(ElfRelocType::BRANCH, Some(sym), None);
                     self.write(&bne(rs1, rs2, 0));
                 }
                 "j" => {
                     let (sym,) = extract!(Symbol);
-                    let sym = self.process_symbol(sym, SymbolType::Unknown, None);
+                    let sym = self.emit_symbol(sym, SymbolType::Unknown, None);
 
-                    self.process_reloc(ElfRelocType::JAL, Some(sym), None);
+                    self.emit_relocation(ElfRelocType::JAL, Some(sym), None);
                     self.write(&jal(0, 0));
                 }
 
@@ -926,15 +957,15 @@ mod assembler {
                 "lla" => {
                     let (rd,) = extract!(Reg);
                     let (sym, addend) = Self::process_addr(exprs.pop().unwrap());
-                    let sym = self.process_symbol(Identifier(sym), SymbolType::Unknown, None);
+                    let sym = self.emit_symbol(sym, SymbolType::Unknown, None);
 
-                    self.process_reloc(ElfRelocType::PCREL_HI20, Some(sym), Some(addend));
-                    self.process_reloc(ElfRelocType::RELAX, None, Some(0));
-                    let local_sym = self.emit_temp_local();
+                    self.emit_relocation(ElfRelocType::PCREL_HI20, Some(sym), Some(addend));
+                    self.emit_relocation(ElfRelocType::RELAX, None, Some(0));
+                    let local_sym = self.emit_relocation_label();
                     self.write(&auipc(rd, 0));
 
-                    self.process_reloc(ElfRelocType::PCREL_LO12_I, Some(local_sym), Some(addend));
-                    self.process_reloc(ElfRelocType::RELAX, None, Some(0));
+                    self.emit_relocation(ElfRelocType::PCREL_LO12_I, Some(local_sym), Some(addend));
+                    self.emit_relocation(ElfRelocType::RELAX, None, Some(0));
                     self.write(&addi(rd, rd, 0));
                 }
                 "li" => {
@@ -946,25 +977,33 @@ mod assembler {
                         self.write(&addi(rd, rd, lo));
                     }
                 }
+                "bnez" => {
+                    let (rs, sym) = extract!(Reg, Symbol);
+                    let sym = self.emit_symbol(sym, SymbolType::Unknown, None);
+
+                    self.emit_relocation(ElfRelocType::BRANCH, Some(sym), None);
+                    self.write(&bne(rs, 0, 0));
+                }
 
                 _ => panic!(),
             }
         }
 
-        fn process_addr(expr: Expr) -> (String, isize) {
+        fn process_addr(expr: Expr) -> (Ident, isize) {
             match expr {
-                Expr::Symbol(sym) => (sym.0, 0),
+                Expr::Symbol(sym) => (sym, 0),
                 Expr::BinOp(lhs, OperationType::Plus, rhs) => {
                     let (Expr::Symbol(lhs), Expr::Number(offset)) = (&*lhs, &*rhs) else {
                         panic!();
                     };
-                    (lhs.0.clone(), *offset)
+                    (lhs.clone(), *offset)
                 }
                 _ => panic!(),
             }
         }
 
-        fn process_reloc(
+        /// Emits a new relocation entry at the current address.
+        fn emit_relocation(
             &mut self,
             reloc: ElfRelocType,
             symbol: Option<usize>,
@@ -980,6 +1019,55 @@ mod assembler {
             self.open_section.borrow_mut().relocs.push(reloc);
         }
 
+        /// This function emits a label at the current address used for
+        /// relaxable sequences.
+        ///
+        /// Due to how relaxation works, we must "link" the HI and LO
+        /// relocations somehow, otherwise, it's considered unsafe. The way
+        /// GAS does is that, instead of the two relocations pointing to the
+        /// same symbol, the first points to the symbol itself, and the second
+        /// points to a fake label at the address of the first relocation:
+        ///
+        /// Here's the output for the pseudoinstruction `lla a1, my_label`:
+        /// ```
+        /// 00000000 <.L0 >:
+        ///    0:   00000597                auipc   a1,0x0
+        ///                       0: R_RISCV_PCREL_HI20   my_label
+        ///                       0: R_RISCV_RELAX        *ABS*
+        ///    4:   00058593                mv      a1,a1
+        ///                       4: R_RISCV_PCREL_LO12_I .L0
+        ///                       4: R_RISCV_RELAX        *ABS*
+        /// ```
+        ///
+        /// This "fake" label is a real, local symbol present in ELF's .symtab
+        /// but with a twist: it uses a special name (".L0 ", with the space).
+        /// libopcodes, from Binutils, then uses this name to decide wether or
+        /// not to display/emit the fake label. For example, this label won't
+        /// show up in the disassembler output from objdump.
+        ///
+        /// Reference: <https://github.com/riscv-non-isa/riscv-elf-psabi-doc/blob/master/riscv-elf.adoc#pc-relative-symbol-addresses>.
+        fn emit_relocation_label(&mut self) -> usize {
+            /// From libopcodes:
+            ///
+            /// These fake label defines are use by both the assembler, and
+            /// libopcodes.  The assembler uses this when it needs to generate a fake
+            /// label, and libopcodes uses it to hide the fake labels in its output.
+            const RISCV_FAKE_LABEL_NAME: Ident = Ident::new_inline(".L0 ");
+            #[allow(dead_code)]
+            const RISCV_FAKE_LABEL_CHAR: char = ' ';
+
+            let (section_name, pos) = {
+                let section = self.open_section.borrow();
+                (section.name.clone(), section.buf.len())
+            };
+
+            self.emit_symbol(
+                RISCV_FAKE_LABEL_NAME.clone(),
+                SymbolType::LocalInternal,
+                Some((section_name, pos)),
+            )
+        }
+
         fn write(&mut self, bytes: &[u8]) {
             self.open_section.borrow_mut().buf.extend_from_slice(bytes);
         }
@@ -993,13 +1081,9 @@ mod assembler {
                         let section_name = section.name.clone();
                         let val = section.buf.len();
                         drop(section);
-                        let label = label.0.clone();
+                        let label = label.clone();
 
-                        self.process_symbol(
-                            Identifier(label),
-                            SymbolType::Local,
-                            Some((section_name, val)),
-                        );
+                        self.emit_symbol(label, SymbolType::Unknown, Some((section_name, val)));
                     }
                     TopLevel::Instruction(ident, exprs) => self.consume_instruction(ident, exprs),
                 }
@@ -1016,28 +1100,19 @@ mod assembler {
             }
 
             for sym in &mut self.symbols {
-                if sym.r#type != SymbolType::Unknown && sym.value.is_none() {
-                    sym.r#type = SymbolType::Unknown;
+                if sym.r#type == SymbolType::Unknown {
+                    sym.r#type = if sym.value.is_some() {
+                        SymbolType::Local
+                    } else {
+                        SymbolType::Global
+                    };
                 }
             }
         }
-
-        fn emit_temp_local(&mut self) -> usize {
-            let section = self.open_section.borrow();
-            let section_name = section.name.clone();
-            let val = section.buf.len();
-            drop(section);
-
-            self.process_symbol(
-                Identifier(format!(".L0 ",)),
-                SymbolType::LocalInternal,
-                Some((section_name, val)),
-            )
-        }
     }
 
-    fn reloc_from_func(insn: &str, func: Identifier) -> ElfRelocType {
-        let r#type = match &*func.0 {
+    fn reloc_from_func(insn: &str, func: Ident) -> ElfRelocType {
+        let r#type = match func.as_str() {
             "hi" => ElfRelocType::HI20,
             "lo" if matches!(insn, "addi") => ElfRelocType::LO12_I,
             "pcrel_hi" => ElfRelocType::PCREL_HI20,
@@ -1053,7 +1128,7 @@ mod elf {
 
     use bytes::{BufMut, BytesMut};
     use section::SectionHeader;
-    use symbol::{ElfSymbol, SymbolBinding, SymbolType, SymbolVisibility};
+    use symbol::{ElfSymbol, SymbolBinding, SymbolType};
 
     use crate::assembler::Assembler;
 
@@ -1149,21 +1224,21 @@ mod elf {
                 }
             }
 
-            pub fn symsize(&self) -> usize {
+            pub fn sym_entsize(&self) -> usize {
                 match self {
                     ElfClass::C32 => 16,
                     ElfClass::C64 => 24,
                 }
             }
 
-            pub fn relentsize(&self) -> usize {
+            pub fn rel_entsize(&self) -> usize {
                 match self {
                     ElfClass::C32 => 8,
                     ElfClass::C64 => 16,
                 }
             }
 
-            pub fn relaentsize(&self) -> usize {
+            pub fn rela_entsize(&self) -> usize {
                 match self {
                     ElfClass::C32 => 12,
                     ElfClass::C64 => 24,
@@ -1553,8 +1628,8 @@ mod elf {
                     SectionHeader {
                         name: n as u32,
                         r#type: section::SectionType::Rel,
-                        size: (class.relentsize() * rels.len()) as u64,
-                        entsize: class.relentsize() as u64,
+                        size: (class.rel_entsize() * rels.len()) as u64,
+                        entsize: class.rel_entsize() as u64,
                         info: shndx as u32,
                         ..Default::default()
                     },
@@ -1568,8 +1643,8 @@ mod elf {
                     SectionHeader {
                         name: n as u32,
                         r#type: section::SectionType::Rela,
-                        size: (class.relaentsize() * relas.len()) as u64,
-                        entsize: class.relaentsize() as u64,
+                        size: (class.rela_entsize() * relas.len()) as u64,
+                        entsize: class.rela_entsize() as u64,
                         info: shndx as u32,
                         ..Default::default()
                     },
@@ -1597,9 +1672,9 @@ mod elf {
         let symtab = elf_file.add_section(SectionHeader {
             name: symtab,
             r#type: section::SectionType::Symtab,
-            size: (elf_file.symbols.len() * class.symsize()) as u64,
+            size: (elf_file.symbols.len() * class.sym_entsize()) as u64,
             link: strtab as u32,
-            entsize: class.symsize() as u64,
+            entsize: class.sym_entsize() as u64,
             info: first_non_local_symbol as u32,
             ..Default::default()
         });
