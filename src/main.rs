@@ -661,7 +661,7 @@ mod parser {
 }
 
 mod assembler {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{cell::RefCell, rc::Rc, str::FromStr};
 
     use crate::{addi, auipc, bne, elf::reloc::ElfRelocType, jal, lb, lui, sb};
 
@@ -708,8 +708,19 @@ mod assembler {
         pub value: Option<(Ident, usize)>,
     }
 
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum SectionType {
+        #[default]
+        Text,
+        Bss,
+        Data,
+        Rodata,
+        Unknown,
+    }
+
     pub struct Section {
         pub name: Ident,
+        pub r#type: SectionType,
         pub buf: Vec<u8>,
         pub relocs: Vec<Reloc>,
     }
@@ -718,6 +729,7 @@ mod assembler {
         fn default() -> Self {
             Self {
                 name: ".text".into(),
+                r#type: Default::default(),
                 buf: Default::default(),
                 relocs: Default::default(),
             }
@@ -774,11 +786,21 @@ mod assembler {
                 }
                 "string" | "asciz" => self.write(&extract_values!(String)),
 
-                "section" => self.process_section(extract_values!(Symbol)),
-                "text" => self.process_section("text".into()),
-                "data" => self.process_section("data".into()),
-                "rodata" => self.process_section("rodata".into()),
-                "bss" => self.process_section("bss".into()),
+                "section" => {
+                    let sym = extract_values!(Symbol);
+                    let r#type = match sym.as_str() {
+                        _ if sym.starts_with(".text") => SectionType::Text,
+                        _ if sym.starts_with(".data") => SectionType::Data,
+                        _ if sym.starts_with(".rodata") => SectionType::Rodata,
+                        _ if sym.starts_with(".bss") => SectionType::Bss,
+                        _ => SectionType::Unknown,
+                    };
+                    self.emit_section(sym, r#type)
+                }
+                "text" => self.emit_section(".text".into(), SectionType::Text),
+                "data" => self.emit_section(".data".into(), SectionType::Data),
+                "rodata" => self.emit_section(".rodata".into(), SectionType::Rodata),
+                "bss" => self.emit_section(".bss".into(), SectionType::Bss),
 
                 // "byte" => {
                 //     let v = extract_values!(Number);
@@ -798,7 +820,7 @@ mod assembler {
             };
         }
 
-        fn process_section(&mut self, section_name: Ident) {
+        fn emit_section(&mut self, section_name: Ident, r#type: SectionType) {
             if let Some(section) = self
                 .sections
                 .iter()
@@ -808,6 +830,7 @@ mod assembler {
             } else {
                 let section = Rc::new(RefCell::new(Section {
                     name: section_name,
+                    r#type,
                     ..Default::default()
                 }));
                 self.sections.push(section.clone());
@@ -1588,10 +1611,27 @@ mod elf {
             let section = section.borrow();
 
             let name = elf_file.add_section_str(&section.name) as u32;
+
+            let r#type = match section.r#type {
+                crate::assembler::SectionType::Bss => section::SectionType::Nobits,
+                _ => section::SectionType::Progbits,
+            };
+
+            let flags = match section.r#type {
+                crate::assembler::SectionType::Text => {
+                    section::section_flags::SHF_ALLOC | section::section_flags::SHF_EXECINSTR
+                }
+                crate::assembler::SectionType::Bss | crate::assembler::SectionType::Data => {
+                    section::section_flags::SHF_ALLOC | section::section_flags::SHF_WRITE
+                }
+                crate::assembler::SectionType::Rodata => section::section_flags::SHF_ALLOC,
+                crate::assembler::SectionType::Unknown => 0,
+            };
+
             let shndx = elf_file.add_section(SectionHeader {
                 name,
-                r#type: section::SectionType::Progbits,
-                flags: section::section_flags::SHF_ALLOC | section::section_flags::SHF_EXECINSTR,
+                r#type,
+                flags,
                 offset: 0,
                 size: section.buf.len() as u64,
                 addralign: 4,
@@ -1628,6 +1668,7 @@ mod elf {
                     SectionHeader {
                         name: n as u32,
                         r#type: section::SectionType::Rel,
+                        flags: section::section_flags::SHF_INFO_LINK,
                         size: (class.rel_entsize() * rels.len()) as u64,
                         entsize: class.rel_entsize() as u64,
                         info: shndx as u32,
@@ -1643,6 +1684,7 @@ mod elf {
                     SectionHeader {
                         name: n as u32,
                         r#type: section::SectionType::Rela,
+                        flags: section::section_flags::SHF_INFO_LINK,
                         size: (class.rela_entsize() * relas.len()) as u64,
                         entsize: class.rela_entsize() as u64,
                         info: shndx as u32,

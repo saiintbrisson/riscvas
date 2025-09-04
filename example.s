@@ -14,4 +14,5 @@ print:
 exit:
     j exit
 
+.section .rodata
 hello_world: .string "Hello, World!\n\0"
