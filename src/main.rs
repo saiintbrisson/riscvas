@@ -6,7 +6,7 @@ fn main() {
     let out = std::env::args().nth(2).unwrap();
 
     let lexer = lexer::Lexer::new(&program);
-    let parsed = parser::Parser::new(&lexer).parse();
+    let parsed = parser::Parser::new(&lexer);
     let mut assembler = assembler::Assembler::new(parsed);
     assembler.assemble();
 
@@ -471,6 +471,21 @@ mod parser {
         tokens: Peekable<LexerIter<'a>>,
     }
 
+    impl<'a> Iterator for Parser<'a> {
+        type Item = TopLevel;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            match self.peek().0 {
+                TokenType::NewLine => {
+                    self.advance();
+                    self.next()
+                }
+                TokenType::Eof => return None,
+                _ => Some(self.parse_token()),
+            }
+        }
+    }
+
     impl<'a> Parser<'a> {
         pub fn new(lexer: &'a Lexer<'a>) -> Self {
             Self {
@@ -478,28 +493,21 @@ mod parser {
             }
         }
 
-        fn peek(&mut self) -> TokenType {
-            self.tokens
-                .peek()
-                .map(|(ty, _)| *ty)
-                .unwrap_or(TokenType::Eof)
+        fn peek(&mut self) -> &(TokenType, &'a str) {
+            self.tokens.peek().unwrap_or(&(TokenType::Eof, ""))
         }
 
-        fn step(&mut self) -> (TokenType, &'a str) {
-            static EMPTY: Lexeme = Lexeme::inline("");
-            self.tokens
-                .next()
-                .map(|token| (token.0, token.1))
-                .unwrap_or((TokenType::Eof, ""))
+        fn advance(&mut self) -> (TokenType, &'a str) {
+            self.tokens.next().unwrap_or((TokenType::Eof, ""))
         }
 
         fn is(&mut self, token: TokenType) -> bool {
-            self.peek() == token
+            self.peek().0 == token
         }
 
         fn eat(&mut self, token: TokenType) -> Option<&'a str> {
             if self.is(token) {
-                Some(self.step().1)
+                Some(self.advance().1)
             } else {
                 None
             }
@@ -508,9 +516,9 @@ mod parser {
         pub fn parse(mut self) -> Vec<TopLevel> {
             let mut parsed = Vec::new();
             loop {
-                match self.peek() {
+                match self.peek().0 {
                     TokenType::NewLine => {
-                        self.step();
+                        self.advance();
                         continue;
                     }
                     TokenType::Eof => break,
@@ -521,7 +529,7 @@ mod parser {
         }
 
         fn parse_token(&mut self) -> TopLevel {
-            let identifier = self.eat(TokenType::Identifier).unwrap().clone();
+            let identifier = self.eat(TokenType::Identifier).unwrap();
 
             if self.eat(TokenType::Colon).is_some() {
                 return TopLevel::Label(Ident(identifier.into()));
@@ -558,70 +566,30 @@ mod parser {
         }
 
         fn parse_value(&mut self) -> Option<Expr> {
-            fn extract_radix(int: &str) -> (&str, u32) {
-                let (int, radix) = if let Some(int) = int.strip_prefix("0b") {
-                    (int, 2)
-                } else if let Some(int) = int.strip_prefix("0o") {
-                    (int, 8)
-                } else if let Some(int) = int.strip_prefix("0x") {
-                    (int, 16)
-                } else {
-                    (int, 10)
-                };
-                (int, radix)
-            }
-
-            let val = if self.eat(TokenType::LParen).is_some() {
-                let val = self.parse_value().expect("expected value");
-                self.eat(TokenType::RParen).expect("expected r-paren");
-                Expr::Deref(Box::new(val))
-            } else if self.eat(TokenType::Hyphen).is_some() {
-                if let Some(int) = self.eat(TokenType::Integer) {
-                    let (int, radix) = extract_radix(int);
-                    Expr::Number(isize::from_str_radix(&format!("-{int}"), radix).unwrap())
-                } else {
-                    Expr::Unary(OperationType::Minus, Box::new(self.parse_value().unwrap()))
+            let val = match &self.peek().0 {
+                TokenType::LParen => {
+                    self.advance();
+                    let val = self.parse_value().expect("expected value");
+                    self.eat(TokenType::RParen).expect("expected r-paren");
+                    Expr::Deref(Box::new(val))
                 }
-            } else if self.eat(TokenType::Plus).is_some() {
-                Expr::Unary(OperationType::Plus, Box::new(self.parse_value().unwrap()))
-            } else if let Some(int) = self.eat(TokenType::Integer) {
-                let (int, radix) = extract_radix(int);
-                Expr::Number(isize::from_str_radix(int, radix).unwrap())
-            } else if let Some(ident) = self.eat(TokenType::Identifier) {
-                if ident.starts_with('%') {
-                    let func_name = Ident((&ident[1..]).into());
-
-                    self.eat(TokenType::LParen).expect("invalid function call");
-                    let val = self.parse_value().expect("call must have a parameter");
-                    self.eat(TokenType::RParen).expect("invalid function call");
-
-                    Expr::RelocFunction(func_name, Box::new(val))
-                } else {
-                    Expr::Symbol(Ident(ident.into()))
-                }
-            } else if let Some(fo) = self.eat(TokenType::String) {
-                let string = fo.get(1..fo.len() - 1).unwrap_or_default().to_string();
-                let mut buf = Vec::with_capacity(string.as_bytes().len());
-                let mut escaping = false;
-                for c in string.chars() {
-                    match c {
-                        '0'..'9' if escaping => {
-                            escaping = false;
-                            buf.push(c as u8 - '0' as u8);
-                        }
-                        'n' if escaping => {
-                            escaping = false;
-                            buf.push('\n' as u8);
-                        }
-                        c if escaping => panic!("unexpected escaped character {c:?}"),
-                        '\\' => escaping = true,
-                        c => buf.push(c as u8),
+                TokenType::Hyphen => {
+                    self.advance();
+                    if let Some(int) = self.eat(TokenType::Integer) {
+                        let (int, radix) = extract_radix(int);
+                        Expr::Number(isize::from_str_radix(&format!("-{int}"), radix).unwrap())
+                    } else {
+                        Expr::Unary(OperationType::Minus, Box::new(self.parse_value().unwrap()))
                     }
                 }
-
-                Expr::String(buf)
-            } else {
-                return None;
+                TokenType::Plus => {
+                    self.advance();
+                    Expr::Unary(OperationType::Plus, Box::new(self.parse_value().unwrap()))
+                }
+                TokenType::Identifier => self.parse_ident(),
+                TokenType::String => self.parse_string(),
+                TokenType::Integer => self.parse_int(),
+                _ => return None,
             };
 
             let lhs = if self.eat(TokenType::LParen).is_some() {
@@ -632,18 +600,76 @@ mod parser {
                 val
             };
 
-            let op = if self.eat(TokenType::Plus).is_some() {
-                OperationType::Plus
-            } else if self.eat(TokenType::Hyphen).is_some() {
-                OperationType::Minus
-            } else {
-                return Some(lhs);
+            let op = match self.peek().0 {
+                TokenType::Hyphen => OperationType::Minus,
+                TokenType::Plus => OperationType::Plus,
+                _ => return Some(lhs),
             };
+            self.advance();
 
-            let rrhs = self.parse_value().expect("missing right bin op expression");
+            let rhs = self.parse_value().expect("missing right bin op expression");
 
-            Some(Expr::BinOp(Box::new(lhs), op, Box::new(rrhs)))
+            Some(Expr::BinOp(Box::new(lhs), op, Box::new(rhs)))
         }
+
+        fn parse_ident(&mut self) -> Expr {
+            let ident = self.eat(TokenType::Identifier).unwrap();
+            if ident.starts_with('%') {
+                let func_name = Ident((&ident[1..]).into());
+
+                self.eat(TokenType::LParen).expect("invalid function call");
+                let val = self.parse_value().expect("call must have a parameter");
+                self.eat(TokenType::RParen).expect("invalid function call");
+
+                Expr::RelocFunction(func_name, Box::new(val))
+            } else {
+                Expr::Symbol(Ident((*ident).into()))
+            }
+        }
+
+        fn parse_string(&mut self) -> Expr {
+            let str = self.eat(TokenType::String).unwrap();
+            let str = str.get(1..str.len() - 1).unwrap_or_default().to_string();
+
+            let mut buf = Vec::with_capacity(str.as_bytes().len());
+            let mut escaping = false;
+            for c in str.chars() {
+                match c {
+                    '0'..'9' if escaping => {
+                        escaping = false;
+                        buf.push(c as u8 - '0' as u8);
+                    }
+                    'n' if escaping => {
+                        escaping = false;
+                        buf.push('\n' as u8);
+                    }
+                    c if escaping => panic!("unexpected escaped character {c:?}"),
+                    '\\' => escaping = true,
+                    c => buf.push(c as u8),
+                }
+            }
+
+            Expr::String(buf)
+        }
+
+        fn parse_int(&mut self) -> Expr {
+            let int = self.eat(TokenType::Integer).unwrap();
+            let (int, radix) = extract_radix(int);
+            Expr::Number(isize::from_str_radix(int, radix).unwrap())
+        }
+    }
+
+    fn extract_radix(int: &str) -> (&str, u32) {
+        let (int, radix) = if let Some(int) = int.strip_prefix("0b") {
+            (int, 2)
+        } else if let Some(int) = int.strip_prefix("0o") {
+            (int, 8)
+        } else if let Some(int) = int.strip_prefix("0x") {
+            (int, 16)
+        } else {
+            (int, 10)
+        };
+        (int, radix)
     }
 
     #[test]
@@ -684,7 +710,9 @@ mod parser {
 mod assembler {
     use std::{cell::RefCell, rc::Rc};
 
-    use crate::{addi, auipc, beq, bne, elf::reloc::ElfRelocType, jal, jalr, lb, lui, sb};
+    use crate::{
+        addi, auipc, beq, bne, elf::reloc::ElfRelocType, jal, jalr, lb, lui, parser::Parser, sb,
+    };
 
     use super::{
         Reg,
@@ -779,8 +807,8 @@ mod assembler {
         pub addend: Option<isize>,
     }
 
-    pub struct Assembler {
-        items: Vec<TopLevel>,
+    pub struct Assembler<'a> {
+        parser: Option<Parser<'a>>,
 
         pub symbols: Vec<Symbol>,
 
@@ -788,12 +816,12 @@ mod assembler {
         pub open_section: Rc<RefCell<Section>>,
     }
 
-    impl Assembler {
-        pub fn new(items: Vec<TopLevel>) -> Self {
+    impl<'a> Assembler<'a> {
+        pub fn new(parser: Parser<'a>) -> Self {
             let open_section = Rc::new(RefCell::new(Section::default()));
 
             Self {
-                items,
+                parser: Some(parser),
 
                 symbols: Default::default(),
 
@@ -1170,7 +1198,7 @@ mod assembler {
         }
 
         pub fn assemble(&mut self) {
-            for item in self.items.clone() {
+            for item in self.parser.take().unwrap() {
                 match item {
                     TopLevel::Directive(ident, exprs) => self.consume_directive(ident, exprs),
                     TopLevel::Label(label) => {
