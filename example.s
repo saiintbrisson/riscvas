@@ -5,14 +5,24 @@
 _start:
     li a0, 0x10000000
     lla a1, hello_world
-    lb a2, (a1)
-print:
-    sb a2, (a0)
-    addi a1, a1, 1
-    lb a2, (a1)
-    bnez a2, print
-exit:
-    j exit
+    jal puts
+    lla a1, foo_bar
+    jal puts
+.exit:
+    j .exit
+
+puts:
+    mv t0, a1
+    lb t1, (t0)
+    beqz t1, .L2
+.L1:
+    sb t1, (a0)
+    addi t0, t0, 1
+    lb t1, (t0)
+    bnez t1, .L1
+.L2:
+    ret
 
 .section .rodata
 hello_world: .string "Hello, World!\n\0"
+foo_bar: .string "Foo? Bar!\n\0"

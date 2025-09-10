@@ -36,6 +36,14 @@ fn jal(rd: Reg, offset: u32) -> [u8; 4] {
     j(0b1101111, rd, offset).to_le_bytes()
 }
 
+fn jalr(rd: Reg, rs: Reg, offset: u16) -> [u8; 4] {
+    i(0b1100111, rd, 0, rs, offset).to_le_bytes()
+}
+
+fn beq(rs1: Reg, rs2: Reg, offset: u16) -> [u8; 4] {
+    b(0b1100011, offset, 0b000, rs1, rs2).to_le_bytes()
+}
+
 fn bne(rs1: Reg, rs2: Reg, offset: u16) -> [u8; 4] {
     b(0b1100011, offset, 0b001, rs1, rs2).to_le_bytes()
 }
@@ -75,7 +83,7 @@ insn_type!(i {
     opcode: u8 => 0..7,
     rd: u8 => 7..12,
     funct3: u8 => 12..15,
-    rs1: u8 => 15..20,
+    rs: u8 => 15..20,
     imm: u16 => 20..32,
 });
 
@@ -661,32 +669,29 @@ mod parser {
 }
 
 mod assembler {
-    use std::{cell::RefCell, rc::Rc, str::FromStr};
+    use std::{cell::RefCell, rc::Rc};
 
-    use crate::{addi, auipc, bne, elf::reloc::ElfRelocType, jal, lb, lui, sb};
+    use crate::{addi, auipc, beq, bne, elf::reloc::ElfRelocType, jal, jalr, lb, lui, sb};
 
     use super::{
         Reg,
         parser::{Expr, Ident, OperationType, TopLevel},
     };
 
-    fn register_from_name(mut reg: &str) -> Reg {
-        const REGISTERS: &[&str] = &[
-            "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1", "a2", "a3",
-            "a4", "a5", "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
-            "t3", "t4", "t5", "t6",
-        ];
+    fn find_register(reg: &str) -> Reg {
+        static REGISTERS: phf::Map<&'static str, u8> = phf::phf_map! {
+            "x0" => 0, "x1" => 1, "x2" => 2, "x3" => 3, "x4" => 4, "x5" => 5, "x6" => 6, "x7" => 7, "x8" => 8, "x9" => 9, "x10" => 10, "x11" => 11, "x12" => 12, "x13" => 13,
+            "x14" => 14, "x15" => 15, "x16" => 16, "x17" => 17, "x18" => 18, "x19" => 19, "x20" => 20, "x21" => 21, "x22" => 22, "x23" => 23, "x24" => 24, "x25" => 25, "x26" => 26, "x27" => 27,
+            "x28" => 28, "x29" => 29, "x30" => 30, "x31" => 31,
 
-        if reg == "fp" {
-            reg = "s0";
-        }
+            "zero" => 0, "ra" => 1, "sp" => 2, "gp" => 3, "tp" => 4, "t0" => 5, "t1" => 6, "t2" => 7, "s0" => 8, "s1" => 9, "a0" => 10, "a1" => 11, "a2" => 12, "a3" => 13,
+            "a4" => 14, "a5" => 15, "a6" => 16, "a7" => 17, "s2" => 18, "s3" => 19, "s4" => 20, "s5" => 21, "s6" => 22, "s7" => 23, "s8" => 24, "s9" => 25, "s10" => 26, "s11" => 27,
+            "t3" => 28, "t4" => 29, "t5" => 30, "t6" => 31,
 
-        REGISTERS
-            .iter()
-            .enumerate()
-            .find(|(_, o)| **o == reg)
-            .expect("unknown reg")
-            .0 as u8
+            "fp" => 8
+        };
+
+        *REGISTERS.get(reg).expect("unknown reg")
     }
 
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -723,6 +728,24 @@ mod assembler {
         pub r#type: SectionType,
         pub buf: Vec<u8>,
         pub relocs: Vec<Reloc>,
+    }
+
+    impl Section {
+        pub fn new(name: Ident) -> Self {
+            let r#type = match name.as_str() {
+                _ if name.starts_with(".text") => SectionType::Text,
+                _ if name.starts_with(".data") => SectionType::Data,
+                _ if name.starts_with(".rodata") => SectionType::Rodata,
+                _ if name.starts_with(".bss") => SectionType::Bss,
+                _ => SectionType::Unknown,
+            };
+
+            Self {
+                name,
+                r#type,
+                ..Default::default()
+            }
+        }
     }
 
     impl Default for Section {
@@ -786,21 +809,32 @@ mod assembler {
                 }
                 "string" | "asciz" => self.write(&extract_values!(String)),
 
-                "section" => {
-                    let sym = extract_values!(Symbol);
-                    let r#type = match sym.as_str() {
-                        _ if sym.starts_with(".text") => SectionType::Text,
-                        _ if sym.starts_with(".data") => SectionType::Data,
-                        _ if sym.starts_with(".rodata") => SectionType::Rodata,
-                        _ if sym.starts_with(".bss") => SectionType::Bss,
-                        _ => SectionType::Unknown,
-                    };
-                    self.emit_section(sym, r#type)
+                "section" => self.emit_section(extract_values!(Symbol)),
+                "text" => {
+                    if !exprs.is_empty() {
+                        panic!("subsections are not supported");
+                    }
+                    self.emit_section(".text".into())
                 }
-                "text" => self.emit_section(".text".into(), SectionType::Text),
-                "data" => self.emit_section(".data".into(), SectionType::Data),
-                "rodata" => self.emit_section(".rodata".into(), SectionType::Rodata),
-                "bss" => self.emit_section(".bss".into(), SectionType::Bss),
+                "data" => {
+                    if !exprs.is_empty() {
+                        panic!("subsections are not supported");
+                    }
+                    self.emit_section(".data".into())
+                }
+                "rodata" => {
+                    if !exprs.is_empty() {
+                        panic!("subsections are not supported");
+                    }
+                    self.emit_section(".rodata".into())
+                }
+                "bss" => {
+                    if !exprs.is_empty() {
+                        panic!("subsections are not supported");
+                    }
+
+                    self.emit_section(".bss".into())
+                }
 
                 // "byte" => {
                 //     let v = extract_values!(Number);
@@ -820,19 +854,15 @@ mod assembler {
             };
         }
 
-        fn emit_section(&mut self, section_name: Ident, r#type: SectionType) {
+        fn emit_section(&mut self, name: Ident) {
             if let Some(section) = self
                 .sections
                 .iter()
-                .find(|section| section.borrow().name == section_name)
+                .find(|section| section.borrow().name == name)
             {
                 self.open_section = section.clone();
             } else {
-                let section = Rc::new(RefCell::new(Section {
-                    name: section_name,
-                    r#type,
-                    ..Default::default()
-                }));
+                let section = Rc::new(RefCell::new(Section::new(name)));
                 self.sections.push(section.clone());
                 self.open_section = section;
             }
@@ -885,7 +915,7 @@ mod assembler {
             macro_rules! extract {
                 (v: Reg) => {
                     match exprs.remove(0) {
-                        Expr::Symbol(arg0) => register_from_name(&arg0),
+                        Expr::Symbol(arg0) => find_register(&arg0),
                         r => panic!("unexpected {r:?}, expected Reg"),
                     }
                 };
@@ -925,7 +955,7 @@ mod assembler {
                         },
                         _ => panic!(),
                     };
-                    let dst = register_from_name(&dst);
+                    let dst = find_register(&dst);
 
                     self.write(&sb(src, dst, offset as u16));
                 }
@@ -944,7 +974,7 @@ mod assembler {
                         },
                         _ => panic!(),
                     };
-                    let src = register_from_name(&src);
+                    let src = find_register(&src);
 
                     self.write(&lb(rd, src, offset as u16));
                 }
@@ -953,8 +983,23 @@ mod assembler {
                     self.write(&auipc(rd, imm as u32));
                 }
                 "jal" => {
-                    let (rd, offset) = extract!(Reg, Number);
-                    self.write(&jal(rd, offset as u32));
+                    if exprs.len() == 1 {
+                        let (sym,) = extract!(Symbol);
+                        let sym = self.emit_symbol(sym, SymbolType::Unknown, None);
+
+                        self.emit_relocation(ElfRelocType::JAL, Some(sym), None);
+                        self.write(&jal(1, 0));
+                    } else {
+                        let (rd, offset) = extract!(Reg, Number);
+                        self.write(&jal(rd, offset as u32));
+                    }
+                }
+                "beq" => {
+                    let (rs1, rs2, sym) = extract!(Reg, Reg, Symbol);
+                    let sym = self.emit_symbol(sym, SymbolType::Unknown, None);
+
+                    self.emit_relocation(ElfRelocType::BRANCH, Some(sym), None);
+                    self.write(&beq(rs1, rs2, 0));
                 }
                 "bne" => {
                     let (rs1, rs2, sym) = extract!(Reg, Reg, Symbol);
@@ -962,13 +1007,6 @@ mod assembler {
 
                     self.emit_relocation(ElfRelocType::BRANCH, Some(sym), None);
                     self.write(&bne(rs1, rs2, 0));
-                }
-                "j" => {
-                    let (sym,) = extract!(Symbol);
-                    let sym = self.emit_symbol(sym, SymbolType::Unknown, None);
-
-                    self.emit_relocation(ElfRelocType::JAL, Some(sym), None);
-                    self.write(&jal(0, 0));
                 }
 
                 // Pseudoinstructions
@@ -1000,6 +1038,13 @@ mod assembler {
                         self.write(&addi(rd, rd, lo));
                     }
                 }
+                "beqz" => {
+                    let (rs, sym) = extract!(Reg, Symbol);
+                    let sym = self.emit_symbol(sym, SymbolType::Unknown, None);
+
+                    self.emit_relocation(ElfRelocType::BRANCH, Some(sym), None);
+                    self.write(&beq(rs, 0, 0));
+                }
                 "bnez" => {
                     let (rs, sym) = extract!(Reg, Symbol);
                     let sym = self.emit_symbol(sym, SymbolType::Unknown, None);
@@ -1007,8 +1052,24 @@ mod assembler {
                     self.emit_relocation(ElfRelocType::BRANCH, Some(sym), None);
                     self.write(&bne(rs, 0, 0));
                 }
+                "j" => match exprs.pop().expect("missing argument") {
+                    Expr::Symbol(sym) => {
+                        let sym = self.emit_symbol(sym, SymbolType::Unknown, None);
 
-                _ => panic!(),
+                        self.emit_relocation(ElfRelocType::JAL, Some(sym), None);
+                        self.write(&jal(0, 0));
+                    }
+                    Expr::Number(offset) => {
+                        self.emit_relocation(ElfRelocType::JAL, None, None);
+                        self.write(&jal(0, offset as u32));
+                    }
+                    e => panic!("unexpected {e:?}"),
+                },
+                "ret" => {
+                    self.write(&jalr(0, 1, 0));
+                }
+
+                insn => panic!("unsupported instruction {insn:?}"),
             }
         }
 
