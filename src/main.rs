@@ -5,8 +5,8 @@ fn main() {
     let program = std::fs::read_to_string(program).unwrap();
     let out = std::env::args().nth(2).unwrap();
 
-    let tokens = lexer::Lexer::new(&program).run();
-    let parsed = parser::Parser::new(tokens).parse();
+    let lexer = lexer::Lexer::new(&program);
+    let parsed = parser::Parser::new(&lexer).parse();
     let mut assembler = assembler::Assembler::new(parsed);
     assembler.assemble();
 
@@ -149,7 +149,7 @@ type DOUBLEWORD = u64;
 type QUADWORD = u128;
 
 mod lexer {
-    use std::iter::Peekable;
+    use std::{iter::Peekable, str::CharIndices};
 
     pub type Lexeme = ecow::EcoString;
 
@@ -201,108 +201,115 @@ mod lexer {
         }
     }
 
+    fn take_while<F: FnMut(char) -> bool>(
+        chars: &mut Peekable<impl Iterator<Item = (usize, char)>>,
+        mut f: F,
+    ) -> Option<usize> {
+        while let Some((end, c)) = chars.peek() {
+            if !f(*c) {
+                return Some(end - 1);
+            }
+            let _ = chars.next();
+        }
+        None
+    }
+
+    pub struct LexerIter<'a>(Peekable<CharIndices<'a>>, &'a str);
+
+    impl<'a> LexerIter<'a> {
+        fn lex_number(&mut self, idx: usize, c: char) -> (TokenType, &'a str) {
+            let mut expect_integer_type = c == '0';
+            let mut notation = if c.is_ascii_digit() {
+                Some(IntNotation::Decimal)
+            } else {
+                None
+            };
+
+            let mut last = c;
+            let end = take_while(&mut self.0, |c| {
+                if !c.is_ascii_alphanumeric() && !matches!(c, '_' | '.') {
+                    return false;
+                }
+                if let Some(not) = notation {
+                    if expect_integer_type {
+                        expect_integer_type = false;
+                        if !not.accepts_char(c) {
+                            notation = IntNotation::from_char(c);
+                        }
+                    } else if !not.accepts_char(c) {
+                        notation = None;
+                    }
+                }
+
+                if c == '.' && last == '.' {
+                    panic!("identifier cannot have adjacent dots");
+                }
+
+                last = c;
+                true
+            })
+            .unwrap_or(self.1.len() - 1);
+
+            let r#type = if notation.is_some() {
+                TokenType::Integer
+            } else {
+                TokenType::Identifier
+            };
+
+            (r#type, &self.1[idx..=end])
+        }
+    }
+
+    impl<'a> Iterator for LexerIter<'a> {
+        type Item = (TokenType, &'a str);
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let (idx, c) = self.0.next()?;
+            let token = match c {
+                ',' => (TokenType::Comma, &self.1[idx..idx + 1]),
+                ':' => (TokenType::Colon, &self.1[idx..idx + 1]),
+                '-' => (TokenType::Hyphen, &self.1[idx..idx + 1]),
+                '+' => (TokenType::Plus, &self.1[idx..idx + 1]),
+                '(' => (TokenType::LParen, &self.1[idx..idx + 1]),
+                ')' => (TokenType::RParen, &self.1[idx..idx + 1]),
+                '\n' => (TokenType::NewLine, &self.1[idx..idx + 1]),
+                '"' => {
+                    let mut escaping = false;
+                    let end = self
+                        .0
+                        .by_ref()
+                        .find(|(_, c)| {
+                            match c {
+                                _ if escaping => escaping = false,
+                                '"' => return true,
+                                '\\' if !escaping => escaping = true,
+                                _ => {}
+                            }
+                            false
+                        })
+                        .expect("unclosed string")
+                        .0;
+                    (TokenType::String, &self.1[idx..=end])
+                }
+                '#' => {
+                    let _ = take_while(&mut self.0, |c| c != '\n');
+                    return self.next();
+                }
+                c if c.is_whitespace() => return self.next(),
+                _ => self.lex_number(idx, c),
+            };
+
+            Some(token)
+        }
+    }
+
     impl<'a> Lexer<'a> {
         pub fn new(file: &'a str) -> Self {
             Self { file }
         }
 
-        fn take_while<F: FnMut(char) -> bool>(
-            &mut self,
-            chars: &mut Peekable<impl Iterator<Item = (usize, char)>>,
-            mut f: F,
-        ) -> Option<usize> {
-            while let Some((end, c)) = chars.peek() {
-                if !f(*c) {
-                    return Some(end - 1);
-                }
-                let _ = chars.next();
-            }
-            None
-        }
-
-        pub fn run(mut self) -> Vec<(TokenType, Lexeme)> {
-            let mut iter = self.file.char_indices().peekable();
-            let mut tokens = Vec::new();
-
-            while let Some((idx, c)) = iter.next() {
-                let token = match c {
-                    ',' => (TokenType::Comma, c.into()),
-                    ':' => (TokenType::Colon, c.into()),
-                    '-' => (TokenType::Hyphen, c.into()),
-                    '+' => (TokenType::Plus, c.into()),
-                    '(' => (TokenType::LParen, c.into()),
-                    ')' => (TokenType::RParen, c.into()),
-                    '\n' => (TokenType::NewLine, c.into()),
-                    '"' => {
-                        let mut escaping = false;
-                        let end = iter
-                            .by_ref()
-                            .find(|(_, c)| {
-                                match c {
-                                    _ if escaping => escaping = false,
-                                    '"' => return true,
-                                    '\\' if !escaping => escaping = true,
-                                    _ => {}
-                                }
-                                false
-                            })
-                            .expect("unclosed string")
-                            .0;
-                        (TokenType::String, self.file[idx..=end].into())
-                    }
-                    '#' => {
-                        let _ = self.take_while(&mut iter, |c| c != '\n');
-                        continue;
-                    }
-                    c if c.is_whitespace() => continue,
-                    _ => {
-                        let mut expect_integer_type = c == '0';
-                        let mut notation = if c.is_ascii_digit() {
-                            Some(IntNotation::Decimal)
-                        } else {
-                            None
-                        };
-
-                        let mut last = c;
-                        let end = self
-                            .take_while(&mut iter, |c| {
-                                if !c.is_ascii_alphanumeric() && !matches!(c, '_' | '.') {
-                                    return false;
-                                }
-                                if let Some(not) = notation {
-                                    if expect_integer_type {
-                                        expect_integer_type = false;
-                                        if !not.accepts_char(c) {
-                                            notation = IntNotation::from_char(c);
-                                        }
-                                    } else if !not.accepts_char(c) {
-                                        notation = None;
-                                    }
-                                }
-
-                                if c == '.' && last == '.' {
-                                    panic!("identifier cannot have adjacent dots");
-                                }
-
-                                last = c;
-                                true
-                            })
-                            .unwrap_or(self.file.len() - 1);
-
-                        let r#type = if notation.is_some() {
-                            TokenType::Integer
-                        } else {
-                            TokenType::Identifier
-                        };
-
-                        (r#type, self.file[idx..=end].into())
-                    }
-                };
-
-                tokens.push(token);
-            }
-
-            tokens
+        pub fn iter(&self) -> LexerIter<'_> {
+            LexerIter(self.file.char_indices().peekable(), &self.file)
         }
     }
 
@@ -325,19 +332,23 @@ mod lexer {
             bomdia:
                 add rs1, 0
         ";
+
         let lexer = Lexer { file };
-        let tokens = lexer.run();
+        let tokens: Vec<_> = lexer.iter().collect();
 
         dbg!(tokens);
     }
 }
 
 mod parser {
-    use std::ops::{Deref, DerefMut};
+    use std::{
+        iter::Peekable,
+        ops::{Deref, DerefMut},
+    };
 
     use ecow::EcoString;
 
-    use crate::lexer::Lexeme;
+    use crate::lexer::{Lexeme, Lexer, LexerIter};
 
     use super::lexer::TokenType;
 
@@ -456,38 +467,37 @@ mod parser {
         }
     }
 
-    pub struct Parser {
-        tokens: Vec<(TokenType, Lexeme)>,
-        cursor: usize,
+    pub struct Parser<'a> {
+        tokens: Peekable<LexerIter<'a>>,
     }
 
-    impl Parser {
-        pub fn new(tokens: Vec<(TokenType, Lexeme)>) -> Self {
-            Self { tokens, cursor: 0 }
+    impl<'a> Parser<'a> {
+        pub fn new(lexer: &'a Lexer<'a>) -> Self {
+            Self {
+                tokens: lexer.iter().peekable(),
+            }
         }
 
         fn peek(&mut self) -> TokenType {
             self.tokens
-                .get(self.cursor)
+                .peek()
                 .map(|(ty, _)| *ty)
                 .unwrap_or(TokenType::Eof)
         }
 
-        fn step(&mut self) -> (TokenType, &Lexeme) {
+        fn step(&mut self) -> (TokenType, &'a str) {
             static EMPTY: Lexeme = Lexeme::inline("");
-            if let Some(token) = self.tokens.get(self.cursor) {
-                self.cursor += 1;
-                (token.0, &token.1)
-            } else {
-                (TokenType::Eof, &EMPTY)
-            }
+            self.tokens
+                .next()
+                .map(|token| (token.0, token.1))
+                .unwrap_or((TokenType::Eof, ""))
         }
 
         fn is(&mut self, token: TokenType) -> bool {
             self.peek() == token
         }
 
-        fn eat(&mut self, token: TokenType) -> Option<&Lexeme> {
+        fn eat(&mut self, token: TokenType) -> Option<&'a str> {
             if self.is(token) {
                 Some(self.step().1)
             } else {
@@ -514,14 +524,14 @@ mod parser {
             let identifier = self.eat(TokenType::Identifier).unwrap().clone();
 
             if self.eat(TokenType::Colon).is_some() {
-                return TopLevel::Label(Ident(identifier));
+                return TopLevel::Label(Ident(identifier.into()));
             }
 
             let args = self.parse_list();
             if identifier.starts_with('.') {
                 TopLevel::Directive(Ident(identifier.trim_start_matches('.').into()), args)
             } else {
-                TopLevel::Instruction(Ident(identifier), args)
+                TopLevel::Instruction(Ident(identifier.into()), args)
             }
         }
 
@@ -639,8 +649,8 @@ mod parser {
     #[test]
     fn foo() {
         let file = include_str!("../example.s");
-        let tokens = super::lexer::Lexer::new(file).run();
-        let parsed = Parser { tokens, cursor: 0 }.parse();
+        let lexer = super::lexer::Lexer::new(file);
+        let parsed = Parser::new(&lexer).parse();
 
         let mut string = String::new();
         for p in &parsed {
