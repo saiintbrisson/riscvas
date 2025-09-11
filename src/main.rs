@@ -3,120 +3,15 @@ mod elf;
 fn main() {
     let program = std::env::args().nth(1).unwrap();
     let program = std::fs::read_to_string(program).unwrap();
-    let out = std::env::args().nth(2).unwrap();
 
-    let lexer = lexer::Lexer::new(&program);
-    let parsed = parser::Parser::new(&lexer);
-    let mut assembler = assembler::Assembler::new(parsed);
+    let mut assembler = assembler::Assembler::new(&program);
     assembler.assemble();
 
+    let out = std::env::args().nth(2).unwrap();
     elf::write_elf_file(&out, &assembler);
 }
 
 type Reg = u8;
-
-fn lui(rd: Reg, imm: u32) -> [u8; 4] {
-    u(0b0110111, rd, imm).to_le_bytes()
-}
-
-fn auipc(rd: Reg, imm: u32) -> [u8; 4] {
-    u(0b0010111, rd, imm).to_le_bytes()
-}
-
-fn addi(rd: Reg, rs1: Reg, imm: u16) -> [u8; 4] {
-    i(0b0010011, rd, 0b000, rs1, imm).to_le_bytes()
-}
-
-fn sb(src: Reg, base: Reg, offset: u16) -> [u8; 4] {
-    s(0b0100011, offset, 0b000, base, src).to_le_bytes()
-}
-
-fn lb(rd: Reg, base: Reg, offset: u16) -> [u8; 4] {
-    i(0b0000011, rd, 0b000, base, offset).to_le_bytes()
-}
-
-fn jal(rd: Reg, offset: u32) -> [u8; 4] {
-    j(0b1101111, rd, offset).to_le_bytes()
-}
-
-fn jalr(rd: Reg, rs: Reg, offset: u16) -> [u8; 4] {
-    i(0b1100111, rd, 0, rs, offset).to_le_bytes()
-}
-
-fn beq(rs1: Reg, rs2: Reg, offset: u16) -> [u8; 4] {
-    b(0b1100011, offset, 0b000, rs1, rs2).to_le_bytes()
-}
-
-fn bne(rs1: Reg, rs2: Reg, offset: u16) -> [u8; 4] {
-    b(0b1100011, offset, 0b001, rs1, rs2).to_le_bytes()
-}
-
-macro_rules! insn_type {
-    ($n:ident { $($field:ident: $ftype:ty => $($range:expr)+),+ $(,)? }) => {
-        fn $n($($field: $ftype),+) -> u32 {
-            let mut insn = 0;
-
-            $({
-                let mut field_val = $field as u32;
-                $(
-                    #[allow(unused_assignments)]
-                    {
-                        let len = $range.end - $range.start;
-                        insn |= (field_val & !(u32::MAX << len)) << $range.start;
-                        field_val >>= len;
-                    }
-                )+
-            })+
-
-            insn
-        }
-    };
-}
-
-insn_type!(r {
-    opcode: u8 => 0..7,
-    rd: u8 => 7..12,
-    funct3: u8 => 12..15,
-    rs1: u8 => 15..20,
-    rs2: u8 => 20..25,
-    funct7: u8 => 25..32,
-});
-
-insn_type!(i {
-    opcode: u8 => 0..7,
-    rd: u8 => 7..12,
-    funct3: u8 => 12..15,
-    rs: u8 => 15..20,
-    imm: u16 => 20..32,
-});
-
-insn_type!(s {
-    opcode: u8 => 0..7,
-    imm: u16 => 7..12 25..32,
-    funct3: u8 => 12..15,
-    rs1: u8 => 15..20,
-    rs2: u8 => 20..25,
-});
-
-insn_type!(b {
-    opcode: u8 => 0..7,
-    imm: u16 => 8..12 25..31 7..8 31..32,
-    funct3: u8 => 12..15,
-    rs1: u8 => 15..20,
-    rs2: u8 => 20..25,
-});
-
-insn_type!(u {
-    opcode: u8 => 0..7,
-    rd: u8 => 7..12,
-    imm: u32 => 12..32,
-});
-
-insn_type!(j {
-    opcode: u8 => 0..7,
-    rd: u8 => 7..12,
-    imm: u32 => 21..31 20..21 12..20 31..32,
-});
 
 /// The RISC-V ISA is separated in 4 different variants.
 ///
@@ -169,10 +64,6 @@ mod lexer {
         Integer,
     }
 
-    pub struct Lexer<'a> {
-        file: &'a str,
-    }
-
     #[derive(Clone, Copy)]
     enum IntNotation {
         Binary,
@@ -214,9 +105,19 @@ mod lexer {
         None
     }
 
-    pub struct LexerIter<'a>(Peekable<CharIndices<'a>>, &'a str);
+    pub struct Lexer<'a> {
+        file: &'a str,
+        chars: Peekable<CharIndices<'a>>,
+    }
 
-    impl<'a> LexerIter<'a> {
+    impl<'a> Lexer<'a> {
+        pub fn new(file: &'a str) -> Self {
+            Self {
+                file,
+                chars: file.char_indices().peekable(),
+            }
+        }
+
         fn lex_number(&mut self, idx: usize, c: char) -> (TokenType, &'a str) {
             let mut expect_integer_type = c == '0';
             let mut notation = if c.is_ascii_digit() {
@@ -226,7 +127,7 @@ mod lexer {
             };
 
             let mut last = c;
-            let end = take_while(&mut self.0, |c| {
+            let end = take_while(&mut self.chars, |c| {
                 if !c.is_ascii_alphanumeric() && !matches!(c, '_' | '.') {
                     return false;
                 }
@@ -248,7 +149,7 @@ mod lexer {
                 last = c;
                 true
             })
-            .unwrap_or(self.1.len() - 1);
+            .unwrap_or(self.file.len() - 1);
 
             let r#type = if notation.is_some() {
                 TokenType::Integer
@@ -256,27 +157,27 @@ mod lexer {
                 TokenType::Identifier
             };
 
-            (r#type, &self.1[idx..=end])
+            (r#type, &self.file[idx..=end])
         }
     }
 
-    impl<'a> Iterator for LexerIter<'a> {
+    impl<'a> Iterator for Lexer<'a> {
         type Item = (TokenType, &'a str);
 
         fn next(&mut self) -> Option<Self::Item> {
-            let (idx, c) = self.0.next()?;
+            let (idx, c) = self.chars.next()?;
             let token = match c {
-                ',' => (TokenType::Comma, &self.1[idx..idx + 1]),
-                ':' => (TokenType::Colon, &self.1[idx..idx + 1]),
-                '-' => (TokenType::Hyphen, &self.1[idx..idx + 1]),
-                '+' => (TokenType::Plus, &self.1[idx..idx + 1]),
-                '(' => (TokenType::LParen, &self.1[idx..idx + 1]),
-                ')' => (TokenType::RParen, &self.1[idx..idx + 1]),
-                '\n' => (TokenType::NewLine, &self.1[idx..idx + 1]),
+                ',' => (TokenType::Comma, &self.file[idx..=idx]),
+                ':' => (TokenType::Colon, &self.file[idx..=idx]),
+                '-' => (TokenType::Hyphen, &self.file[idx..=idx]),
+                '+' => (TokenType::Plus, &self.file[idx..=idx]),
+                '(' => (TokenType::LParen, &self.file[idx..=idx]),
+                ')' => (TokenType::RParen, &self.file[idx..=idx]),
+                '\n' => (TokenType::NewLine, &self.file[idx..=idx]),
                 '"' => {
                     let mut escaping = false;
                     let end = self
-                        .0
+                        .chars
                         .by_ref()
                         .find(|(_, c)| {
                             match c {
@@ -289,10 +190,10 @@ mod lexer {
                         })
                         .expect("unclosed string")
                         .0;
-                    (TokenType::String, &self.1[idx..=end])
+                    (TokenType::String, &self.file[idx..=end])
                 }
                 '#' => {
-                    let _ = take_while(&mut self.0, |c| c != '\n');
+                    let _ = take_while(&mut self.chars, |c| c != '\n');
                     return self.next();
                 }
                 c if c.is_whitespace() => return self.next(),
@@ -300,16 +201,6 @@ mod lexer {
             };
 
             Some(token)
-        }
-    }
-
-    impl<'a> Lexer<'a> {
-        pub fn new(file: &'a str) -> Self {
-            Self { file }
-        }
-
-        pub fn iter(&self) -> LexerIter<'_> {
-            LexerIter(self.file.char_indices().peekable(), &self.file)
         }
     }
 
@@ -333,8 +224,8 @@ mod lexer {
                 add rs1, 0
         ";
 
-        let lexer = Lexer { file };
-        let tokens: Vec<_> = lexer.iter().collect();
+        let lexer = Lexer::new(file);
+        let tokens: Vec<_> = lexer.collect();
 
         dbg!(tokens);
     }
@@ -346,18 +237,20 @@ mod parser {
         ops::{Deref, DerefMut},
     };
 
-    use ecow::EcoString;
+    use crate::lexer::{Lexeme, Lexer, TokenType};
 
-    use crate::lexer::{Lexeme, Lexer, LexerIter};
-
-    use super::lexer::TokenType;
-
-    #[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct Ident(Lexeme);
 
     impl Ident {
         pub const fn new_inline(s: &str) -> Self {
             Self(Lexeme::inline(s))
+        }
+    }
+
+    impl std::fmt::Display for Ident {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.0.fmt(f)
         }
     }
 
@@ -367,20 +260,8 @@ mod parser {
         }
     }
 
-    impl std::fmt::Debug for Ident {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_fmt(format_args!("Ident({self})"))
-        }
-    }
-
-    impl std::fmt::Display for Ident {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str(&self.0)
-        }
-    }
-
     impl Deref for Ident {
-        type Target = EcoString;
+        type Target = Lexeme;
 
         fn deref(&self) -> &Self::Target {
             &self.0
@@ -393,14 +274,14 @@ mod parser {
         }
     }
 
-    #[derive(Debug, Clone)]
+    #[derive(Clone, Debug)]
     pub enum TopLevel {
         Directive(Ident, Vec<Expr>),
         Label(Ident),
         Instruction(Ident, Vec<Expr>),
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     pub enum Expr {
         String(Vec<u8>),
         Number(isize),
@@ -412,93 +293,29 @@ mod parser {
         Unary(OperationType, Box<Expr>),
     }
 
-    impl std::fmt::Debug for Expr {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::String(arg0) => f.write_fmt(format_args!(
-                    "String({:?})",
-                    String::from_utf8_lossy(arg0).escape_debug()
-                )),
-                Self::Number(arg0) => f.write_fmt(format_args!("Number({arg0})")),
-                Self::Symbol(arg0) => f.write_fmt(format_args!("Symbol({arg0:?})")),
-                Self::Deref(arg0) => f.write_fmt(format_args!("Deref({arg0:?})")),
-                Self::RelocFunction(arg0, arg1) => {
-                    f.write_fmt(format_args!("RelocFunction({arg0:?}, {arg1:?})"))
-                }
-                Self::App(arg0, arg1) => f.write_fmt(format_args!("App({arg0:?}, {arg1:?})")),
-                Self::BinOp(arg0, arg1, arg2) => {
-                    f.write_fmt(format_args!("BinOp({arg0:?}, {arg1:?}, {arg2:?})"))
-                }
-                Self::Unary(arg0, arg1) => f.write_fmt(format_args!("Unary({arg0:?}, {arg1:?})")),
-            }
-        }
-    }
-
-    impl std::fmt::Display for Expr {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::String(arg0) => f.write_fmt(format_args!(
-                    r#""{}""#,
-                    String::from_utf8_lossy(arg0).escape_debug()
-                )),
-                Self::Number(arg0) => f.write_fmt(format_args!("{arg0}")),
-                Self::Symbol(arg0) => f.write_fmt(format_args!("{arg0}")),
-                Self::Deref(arg0) => f.write_fmt(format_args!("({arg0})")),
-                Self::RelocFunction(arg0, arg1) => f.write_fmt(format_args!("%{arg0}({arg1})")),
-                Self::App(arg0, arg1) => f.write_fmt(format_args!("{arg0}({arg1})")),
-                Self::BinOp(arg0, arg1, arg2) => f.write_fmt(format_args!("{arg0} {arg1} {arg2}")),
-                Self::Unary(arg0, arg1) => f.write_fmt(format_args!("{arg0}{arg1}")),
-            }
-        }
-    }
-
-    #[derive(Debug, Clone)]
+    #[derive(Clone, Copy, Debug)]
     pub enum OperationType {
         Plus,
         Minus,
     }
 
-    impl std::fmt::Display for OperationType {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                OperationType::Plus => f.write_str("+"),
-                OperationType::Minus => f.write_str("-"),
-            }
-        }
-    }
-
     pub struct Parser<'a> {
-        tokens: Peekable<LexerIter<'a>>,
-    }
-
-    impl<'a> Iterator for Parser<'a> {
-        type Item = TopLevel;
-
-        fn next(&mut self) -> Option<Self::Item> {
-            match self.peek().0 {
-                TokenType::NewLine => {
-                    self.advance();
-                    self.next()
-                }
-                TokenType::Eof => return None,
-                _ => Some(self.parse_token()),
-            }
-        }
+        lexer: Peekable<Lexer<'a>>,
     }
 
     impl<'a> Parser<'a> {
-        pub fn new(lexer: &'a Lexer<'a>) -> Self {
+        pub fn new(file: &'a str) -> Self {
             Self {
-                tokens: lexer.iter().peekable(),
+                lexer: Lexer::new(file).peekable(),
             }
         }
 
         fn peek(&mut self) -> &(TokenType, &'a str) {
-            self.tokens.peek().unwrap_or(&(TokenType::Eof, ""))
+            self.lexer.peek().unwrap_or(&(TokenType::Eof, ""))
         }
 
         fn advance(&mut self) -> (TokenType, &'a str) {
-            self.tokens.next().unwrap_or((TokenType::Eof, ""))
+            self.lexer.next().unwrap_or((TokenType::Eof, ""))
         }
 
         fn is(&mut self, token: TokenType) -> bool {
@@ -511,21 +328,6 @@ mod parser {
             } else {
                 None
             }
-        }
-
-        pub fn parse(mut self) -> Vec<TopLevel> {
-            let mut parsed = Vec::new();
-            loop {
-                match self.peek().0 {
-                    TokenType::NewLine => {
-                        self.advance();
-                        continue;
-                    }
-                    TokenType::Eof => break,
-                    _ => parsed.push(self.parse_token()),
-                }
-            }
-            parsed
         }
 
         fn parse_token(&mut self) -> TopLevel {
@@ -672,47 +474,133 @@ mod parser {
         (int, radix)
     }
 
-    #[test]
-    fn foo() {
-        let file = include_str!("../example.s");
-        let lexer = super::lexer::Lexer::new(file);
-        let parsed = Parser::new(&lexer).parse();
+    impl<'a> Iterator for Parser<'a> {
+        type Item = TopLevel;
 
-        let mut string = String::new();
-        for p in &parsed {
-            let fmt = match p {
-                TopLevel::Directive(identifier, values) => {
-                    let mut foo = format!(".{} ", identifier.0.to_string());
-                    for v in values {
-                        foo.push_str(&v.to_string());
-                        foo.push_str(", ");
-                    }
-                    foo
+        fn next(&mut self) -> Option<Self::Item> {
+            match self.peek().0 {
+                TokenType::NewLine => {
+                    self.advance();
+                    self.next()
                 }
-                TopLevel::Label(identifier) => format!("{}:", identifier.0),
-                TopLevel::Instruction(identifier, values) => {
-                    let mut foo = format!("    {} ", identifier.0.to_string());
-                    for v in values {
-                        foo.push_str(&v.to_string());
-                        foo.push_str(", ");
-                    }
-                    foo
-                }
-            };
-            string.push_str(&fmt);
-            string.push('\n');
+                TokenType::Eof => return None,
+                _ => Some(self.parse_token()),
+            }
         }
-
-        eprintln!("{string}"); // dbg!(parsed);
     }
+}
+
+mod isa {
+    use super::Reg;
+
+    pub fn lui(rd: Reg, imm: u32) -> [u8; 4] {
+        u(0b0110111, rd, imm).to_le_bytes()
+    }
+
+    pub fn auipc(rd: Reg, imm: u32) -> [u8; 4] {
+        u(0b0010111, rd, imm).to_le_bytes()
+    }
+
+    pub fn addi(rd: Reg, rs1: Reg, imm: u16) -> [u8; 4] {
+        i(0b0010011, rd, 0b000, rs1, imm).to_le_bytes()
+    }
+
+    pub fn sb(src: Reg, base: Reg, offset: u16) -> [u8; 4] {
+        s(0b0100011, offset, 0b000, base, src).to_le_bytes()
+    }
+
+    pub fn lb(rd: Reg, base: Reg, offset: u16) -> [u8; 4] {
+        i(0b0000011, rd, 0b000, base, offset).to_le_bytes()
+    }
+
+    pub fn jal(rd: Reg, offset: u32) -> [u8; 4] {
+        j(0b1101111, rd, offset).to_le_bytes()
+    }
+
+    pub fn jalr(rd: Reg, rs: Reg, offset: u16) -> [u8; 4] {
+        i(0b1100111, rd, 0, rs, offset).to_le_bytes()
+    }
+
+    pub fn beq(rs1: Reg, rs2: Reg, offset: u16) -> [u8; 4] {
+        b(0b1100011, offset, 0b000, rs1, rs2).to_le_bytes()
+    }
+
+    pub fn bne(rs1: Reg, rs2: Reg, offset: u16) -> [u8; 4] {
+        b(0b1100011, offset, 0b001, rs1, rs2).to_le_bytes()
+    }
+
+    macro_rules! insn_type {
+    ($n:ident { $($field:ident: $ftype:ty => $($range:expr)+),+ $(,)? }) => {
+        fn $n($($field: $ftype),+) -> u32 {
+            let mut insn = 0;
+
+            $({
+                let mut field_val = $field as u32;
+                $(
+                    #[allow(unused_assignments)]
+                    {
+                        let len = $range.end - $range.start;
+                        insn |= (field_val & !(u32::MAX << len)) << $range.start;
+                        field_val >>= len;
+                    }
+                )+
+            })+
+
+            insn
+        }
+    };
+}
+
+    insn_type!(r {
+        opcode: u8 => 0..7,
+        rd: u8 => 7..12,
+        funct3: u8 => 12..15,
+        rs1: u8 => 15..20,
+        rs2: u8 => 20..25,
+        funct7: u8 => 25..32,
+    });
+
+    insn_type!(i {
+        opcode: u8 => 0..7,
+        rd: u8 => 7..12,
+        funct3: u8 => 12..15,
+        rs: u8 => 15..20,
+        imm: u16 => 20..32,
+    });
+
+    insn_type!(s {
+        opcode: u8 => 0..7,
+        imm: u16 => 7..12 25..32,
+        funct3: u8 => 12..15,
+        rs1: u8 => 15..20,
+        rs2: u8 => 20..25,
+    });
+
+    insn_type!(b {
+        opcode: u8 => 0..7,
+        imm: u16 => 8..12 25..31 7..8 31..32,
+        funct3: u8 => 12..15,
+        rs1: u8 => 15..20,
+        rs2: u8 => 20..25,
+    });
+
+    insn_type!(u {
+        opcode: u8 => 0..7,
+        rd: u8 => 7..12,
+        imm: u32 => 12..32,
+    });
+
+    insn_type!(j {
+        opcode: u8 => 0..7,
+        rd: u8 => 7..12,
+        imm: u32 => 21..31 20..21 12..20 31..32,
+    });
 }
 
 mod assembler {
     use std::{cell::RefCell, rc::Rc};
 
-    use crate::{
-        addi, auipc, beq, bne, elf::reloc::ElfRelocType, jal, jalr, lb, lui, parser::Parser, sb,
-    };
+    use crate::{elf::reloc::ElfRelocType, parser::Parser};
 
     use super::{
         Reg,
@@ -817,11 +705,11 @@ mod assembler {
     }
 
     impl<'a> Assembler<'a> {
-        pub fn new(parser: Parser<'a>) -> Self {
+        pub fn new(file: &'a str) -> Self {
             let open_section = Rc::new(RefCell::new(Section::default()));
 
             Self {
-                parser: Some(parser),
+                parser: Some(Parser::new(file)),
 
                 symbols: Default::default(),
 
@@ -952,7 +840,9 @@ mod assembler {
             sym.id
         }
 
-        fn consume_instruction(&mut self, mut ident: Ident, mut exprs: Vec<Expr>) {
+        fn emit_instruction(&mut self, mut ident: Ident, mut exprs: Vec<Expr>) {
+            use crate::isa::*;
+
             macro_rules! extract {
                 (v: Reg) => {
                     match exprs.remove(0) {
@@ -1210,7 +1100,7 @@ mod assembler {
 
                         self.emit_symbol(label, SymbolType::Unknown, Some((section_name, val)));
                     }
-                    TopLevel::Instruction(ident, exprs) => self.consume_instruction(ident, exprs),
+                    TopLevel::Instruction(ident, exprs) => self.emit_instruction(ident, exprs),
                 }
             }
 
