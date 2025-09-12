@@ -105,6 +105,7 @@ mod lexer {
         None
     }
 
+    /// An iterator that yields each token and its lexeme.
     pub struct Lexer<'a> {
         file: &'a str,
         chars: Peekable<CharIndices<'a>>,
@@ -237,7 +238,10 @@ mod parser {
         ops::{Deref, DerefMut},
     };
 
-    use crate::lexer::{Lexeme, Lexer, TokenType};
+    use crate::{
+        isa::find_register,
+        lexer::{Lexeme, Lexer, TokenType},
+    };
 
     #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct Ident(Lexeme);
@@ -287,10 +291,70 @@ mod parser {
         Number(isize),
         Symbol(Ident),
         RelocFunction(Ident, Box<Expr>),
-        Deref(Box<Expr>),
+        Deref(Ident),
         App(Box<Expr>, Box<Expr>),
         BinOp(Box<Expr>, OperationType, Box<Expr>),
         Unary(OperationType, Box<Expr>),
+    }
+
+    impl Expr {
+        /// Extracts a base address reference and the offset relative to this base.
+        ///
+        /// Valid syntaxes are:
+        /// ```asm
+        /// lb t0, my_symbol     # my_symbol as symbol
+        /// lb t0, my_symbol + 1 # my_symbol as symbol, offset = 1
+        /// lb t0, (t1)          # t1 as register
+        /// lb t0, -1(t1)        # t1 as register, offset = 1
+        /// lb t0, 10            # offset = 10
+        /// lb t0, 10 - 2        # offset = 8
+        /// lb t0, (t1) + 1      # t1 as symbol, offset = 1
+        /// ```
+        pub fn into_offset(self) -> (OffsetRefrerence, isize) {
+            match self {
+                Expr::Number(offset) => (OffsetRefrerence::None, offset),
+                Expr::Symbol(sym) => (OffsetRefrerence::Symbol(sym), 0),
+                Expr::BinOp(lhs, op, rhs) => {
+                    let (sym, offset) = match (*lhs, *rhs) {
+                        (Expr::Number(lhs), Expr::Number(rhs)) => {
+                            let offset = match op {
+                                OperationType::Plus => lhs + rhs,
+                                OperationType::Minus => lhs - rhs,
+                            };
+
+                            return (OffsetRefrerence::None, offset);
+                        }
+                        (Expr::Number(offset), Expr::Symbol(ident) | Expr::Deref(ident))
+                        | (Expr::Symbol(ident) | Expr::Deref(ident), Expr::Number(offset)) => {
+                            (ident, offset)
+                        }
+                        (lhs, rhs) => panic!("invalid expression: {lhs:?} {op:?} {rhs:?}"),
+                    };
+
+                    let offset = match op {
+                        OperationType::Plus => offset,
+                        OperationType::Minus => offset.wrapping_neg(),
+                    };
+
+                    (OffsetRefrerence::Symbol(sym), offset)
+                }
+                Expr::Deref(reg) => (OffsetRefrerence::Reg(find_register(&reg)), 0),
+                Expr::App(expr, expr1) => match (*expr, *expr1) {
+                    (Expr::Number(offset), Expr::Symbol(sym)) => {
+                        (OffsetRefrerence::Reg(find_register(&sym)), offset)
+                    }
+                    _ => panic!(),
+                },
+                expr => panic!("invalid expr: {expr:?}"),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum OffsetRefrerence {
+        Reg(crate::Reg),
+        Symbol(Ident),
+        None,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -373,7 +437,12 @@ mod parser {
                     self.advance();
                     let val = self.parse_value().expect("expected value");
                     self.eat(TokenType::RParen).expect("expected r-paren");
-                    Expr::Deref(Box::new(val))
+
+                    if let Expr::Symbol(ident) = val {
+                        Expr::Deref(ident)
+                    } else {
+                        val
+                    }
                 }
                 TokenType::Hyphen => {
                     self.advance();
@@ -493,6 +562,21 @@ mod parser {
 mod isa {
     use super::Reg;
 
+    pub fn find_register(reg: &str) -> Reg {
+        static REGISTERS: phf::Map<&'static str, u8> = phf::phf_map! {
+            "x0" => 0, "x1" => 1, "x2" => 2, "x3" => 3, "x4" => 4, "x5" => 5, "x6" => 6, "x7" => 7, "x8" => 8, "x9" => 9, "x10" => 10, "x11" => 11, "x12" => 12, "x13" => 13,
+            "x14" => 14, "x15" => 15, "x16" => 16, "x17" => 17, "x18" => 18, "x19" => 19, "x20" => 20, "x21" => 21, "x22" => 22, "x23" => 23, "x24" => 24, "x25" => 25, "x26" => 26, "x27" => 27,
+            "x28" => 28, "x29" => 29, "x30" => 30, "x31" => 31,
+
+            "zero" => 0, "ra" => 1, "sp" => 2, "gp" => 3, "tp" => 4, "t0" => 5, "t1" => 6, "t2" => 7, "s0" => 8, "s1" => 9, "a0" => 10, "a1" => 11, "a2" => 12, "a3" => 13,
+            "a4" => 14, "a5" => 15, "a6" => 16, "a7" => 17, "s2" => 18, "s3" => 19, "s4" => 20, "s5" => 21, "s6" => 22, "s7" => 23, "s8" => 24, "s9" => 25, "s10" => 26, "s11" => 27,
+            "t3" => 28, "t4" => 29, "t5" => 30, "t6" => 31,
+
+            "fp" => 8
+        };
+
+        *REGISTERS.get(reg).expect("unknown reg")
+    }
     pub fn lui(rd: Reg, imm: u32) -> [u8; 4] {
         u(0b0110111, rd, imm).to_le_bytes()
     }
@@ -600,28 +684,10 @@ mod isa {
 mod assembler {
     use std::{cell::RefCell, rc::Rc};
 
-    use crate::{elf::reloc::ElfRelocType, parser::Parser};
-
-    use super::{
-        Reg,
-        parser::{Expr, Ident, OperationType, TopLevel},
+    use crate::{
+        elf::reloc::ElfRelocType,
+        parser::{Expr, Ident, OffsetRefrerence, Parser, TopLevel},
     };
-
-    fn find_register(reg: &str) -> Reg {
-        static REGISTERS: phf::Map<&'static str, u8> = phf::phf_map! {
-            "x0" => 0, "x1" => 1, "x2" => 2, "x3" => 3, "x4" => 4, "x5" => 5, "x6" => 6, "x7" => 7, "x8" => 8, "x9" => 9, "x10" => 10, "x11" => 11, "x12" => 12, "x13" => 13,
-            "x14" => 14, "x15" => 15, "x16" => 16, "x17" => 17, "x18" => 18, "x19" => 19, "x20" => 20, "x21" => 21, "x22" => 22, "x23" => 23, "x24" => 24, "x25" => 25, "x26" => 26, "x27" => 27,
-            "x28" => 28, "x29" => 29, "x30" => 30, "x31" => 31,
-
-            "zero" => 0, "ra" => 1, "sp" => 2, "gp" => 3, "tp" => 4, "t0" => 5, "t1" => 6, "t2" => 7, "s0" => 8, "s1" => 9, "a0" => 10, "a1" => 11, "a2" => 12, "a3" => 13,
-            "a4" => 14, "a5" => 15, "a6" => 16, "a7" => 17, "s2" => 18, "s3" => 19, "s4" => 20, "s5" => 21, "s6" => 22, "s7" => 23, "s8" => 24, "s9" => 25, "s10" => 26, "s11" => 27,
-            "t3" => 28, "t4" => 29, "t5" => 30, "t6" => 31,
-
-            "fp" => 8
-        };
-
-        *REGISTERS.get(reg).expect("unknown reg")
-    }
 
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
     pub enum SymbolType {
@@ -875,39 +941,37 @@ mod assembler {
                     let (src,) = extract!(Reg);
 
                     let expr = exprs.pop().unwrap();
-                    let (dst, offset) = match &expr {
-                        Expr::Deref(expr) => match &**expr {
-                            Expr::Symbol(ident) => (ident, 0),
-                            _ => panic!(),
-                        },
-                        Expr::App(expr, expr1) => match (&**expr, &**expr1) {
-                            (Expr::Number(offset), Expr::Symbol(ident)) => (ident, *offset),
-                            _ => panic!(),
-                        },
-                        _ => panic!(),
-                    };
-                    let dst = find_register(&dst);
-
-                    self.write(&sb(src, dst, offset as u16));
+                    match expr.into_offset() {
+                        (OffsetRefrerence::Reg(dst), offset) => {
+                            self.write(&sb(src, dst, offset as u16));
+                        }
+                        offset => panic!("invalid arguemnt for sb: {offset:?}"),
+                    }
                 }
                 "lb" => {
                     let (rd,) = extract!(Reg);
 
                     let expr = exprs.pop().unwrap();
-                    let (src, offset) = match &expr {
-                        Expr::Deref(expr) => match &**expr {
-                            Expr::Symbol(ident) => (ident, 0),
-                            _ => panic!(),
-                        },
-                        Expr::App(expr, expr1) => match (&**expr, &**expr1) {
-                            (Expr::Number(offset), Expr::Symbol(ident)) => (ident, *offset),
-                            _ => panic!(),
-                        },
-                        _ => panic!(),
-                    };
-                    let src = find_register(&src);
+                    match expr.into_offset() {
+                        (OffsetRefrerence::None, offset) => {
+                            self.write(&lb(rd, 0, offset as u16));
+                        }
+                        (OffsetRefrerence::Reg(src), offset) => {
+                            self.write(&lb(rd, src, offset as u16));
+                        }
+                        (OffsetRefrerence::Symbol(sym), offset) => {
+                            let sym = self.emit_symbol(sym, SymbolType::Unknown, None);
 
-                    self.write(&lb(rd, src, offset as u16));
+                            self.emit_relocation(ElfRelocType::PCREL_HI20, Some(sym), Some(offset));
+                            self.emit_relocation(ElfRelocType::RELAX, None, Some(offset));
+                            let local_sym = self.emit_relocation_label();
+                            self.write(&auipc(rd, 0));
+
+                            self.emit_relocation(ElfRelocType::PCREL_LO12_I, Some(local_sym), None);
+                            self.emit_relocation(ElfRelocType::RELAX, None, Some(0));
+                            self.write(&lb(rd, rd, 0));
+                        }
+                    }
                 }
                 "auipc" => {
                     let (rd, imm) = extract!(Reg, Number);
@@ -948,17 +1012,32 @@ mod assembler {
                 }
                 "lla" => {
                     let (rd,) = extract!(Reg);
-                    let (sym, addend) = Self::process_addr(exprs.pop().unwrap());
-                    let sym = self.emit_symbol(sym, SymbolType::Unknown, None);
 
-                    self.emit_relocation(ElfRelocType::PCREL_HI20, Some(sym), Some(addend));
-                    self.emit_relocation(ElfRelocType::RELAX, None, Some(0));
-                    let local_sym = self.emit_relocation_label();
-                    self.write(&auipc(rd, 0));
+                    match exprs.pop().unwrap().into_offset() {
+                        (OffsetRefrerence::None, offset) => {
+                            let offset = offset as u32;
+                            self.write(&lui(rd, offset >> 12));
+                            let lo = (offset & (u32::MAX >> 20)) as u16;
+                            if lo != 0 {
+                                self.write(&addi(rd, rd, lo));
+                            }
+                        }
+                        (OffsetRefrerence::Reg(_), _) => {
+                            panic!("invalid expression");
+                        }
+                        (OffsetRefrerence::Symbol(sym), offset) => {
+                            let sym = self.emit_symbol(sym, SymbolType::Unknown, None);
 
-                    self.emit_relocation(ElfRelocType::PCREL_LO12_I, Some(local_sym), Some(addend));
-                    self.emit_relocation(ElfRelocType::RELAX, None, Some(0));
-                    self.write(&addi(rd, rd, 0));
+                            self.emit_relocation(ElfRelocType::PCREL_HI20, Some(sym), Some(offset));
+                            self.emit_relocation(ElfRelocType::RELAX, None, Some(offset));
+                            let local_sym = self.emit_relocation_label();
+                            self.write(&auipc(rd, 0));
+
+                            self.emit_relocation(ElfRelocType::PCREL_LO12_I, Some(local_sym), None);
+                            self.emit_relocation(ElfRelocType::RELAX, None, Some(0));
+                            self.write(&addi(rd, rd, 0));
+                        }
+                    }
                 }
                 "li" => {
                     let (rd, n) = extract!(Reg, Number);
@@ -983,16 +1062,16 @@ mod assembler {
                     self.emit_relocation(ElfRelocType::BRANCH, Some(sym), None);
                     self.write(&bne(rs, 0, 0));
                 }
-                "j" => match exprs.pop().expect("missing argument") {
-                    Expr::Symbol(sym) => {
+                "j" => match exprs.pop().expect("missing argument").into_offset() {
+                    (OffsetRefrerence::None, offset) => {
+                        self.emit_relocation(ElfRelocType::JAL, None, Some(offset));
+                        self.write(&jal(0, offset as u32));
+                    }
+                    (OffsetRefrerence::Symbol(sym), offset) => {
                         let sym = self.emit_symbol(sym, SymbolType::Unknown, None);
 
-                        self.emit_relocation(ElfRelocType::JAL, Some(sym), None);
+                        self.emit_relocation(ElfRelocType::JAL, Some(sym), Some(offset));
                         self.write(&jal(0, 0));
-                    }
-                    Expr::Number(offset) => {
-                        self.emit_relocation(ElfRelocType::JAL, None, None);
-                        self.write(&jal(0, offset as u32));
                     }
                     e => panic!("unexpected {e:?}"),
                 },
@@ -1001,19 +1080,6 @@ mod assembler {
                 }
 
                 insn => panic!("unsupported instruction {insn:?}"),
-            }
-        }
-
-        fn process_addr(expr: Expr) -> (Ident, isize) {
-            match expr {
-                Expr::Symbol(sym) => (sym, 0),
-                Expr::BinOp(lhs, OperationType::Plus, rhs) => {
-                    let (Expr::Symbol(lhs), Expr::Number(offset)) = (&*lhs, &*rhs) else {
-                        panic!();
-                    };
-                    (lhs.clone(), *offset)
-                }
-                _ => panic!(),
             }
         }
 
