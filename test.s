@@ -1,5 +1,10 @@
 .option norvc
 
+.section test2, "ax"
+.section test3, "ax", @nobits
+.section test3
+.section .text
+
 .L0:
 mv a0, a0
 lla a1, t0 + 1000000000
@@ -15,7 +20,6 @@ sb t2, 1(t0)
 # addi  a0, a0, %pcrel_lo(.L0)
 
 msg:
-
 # lla a1, mythingykkk
 .local L0
 # j L1

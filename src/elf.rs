@@ -463,20 +463,11 @@ pub fn write_elf_file<P: AsRef<Path>>(out: P, assembler: &Assembler) {
         let name = elf_file.add_section_str(&section.name) as u32;
 
         let r#type = match section.r#type {
-            crate::assembler::SectionType::Bss => section::SectionType::Nobits,
-            _ => section::SectionType::Progbits,
+            crate::assembler::SectionType::Progbits => section::SectionType::Progbits,
+            crate::assembler::SectionType::Nobits => section::SectionType::Nobits,
         };
 
-        let flags = match section.r#type {
-            crate::assembler::SectionType::Text => {
-                section::section_flags::SHF_ALLOC | section::section_flags::SHF_EXECINSTR
-            }
-            crate::assembler::SectionType::Bss | crate::assembler::SectionType::Data => {
-                section::section_flags::SHF_ALLOC | section::section_flags::SHF_WRITE
-            }
-            crate::assembler::SectionType::Rodata => section::section_flags::SHF_ALLOC,
-            crate::assembler::SectionType::Unknown => 0,
-        };
+        let flags = section.flags.bits() as u64;
 
         let shndx = elf_file.add_section(SectionHeader {
             name,

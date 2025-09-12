@@ -682,7 +682,7 @@ mod isa {
 }
 
 mod assembler {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{cell::RefCell, collections::HashSet, rc::Rc};
 
     use crate::{
         elf::reloc::ElfRelocType,
@@ -711,46 +711,58 @@ mod assembler {
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
     pub enum SectionType {
         #[default]
-        Text,
-        Bss,
-        Data,
-        Rodata,
-        Unknown,
+        Progbits,
+        Nobits,
+    }
+
+    bitflags::bitflags! {
+        pub struct SectionFlags: u32 {
+            const WRITABLE = 0b001;
+            const ALLOCATABLE = 0b010;
+            const EXECUTABLE = 0b100;
+        }
     }
 
     pub struct Section {
         pub name: Ident,
         pub r#type: SectionType,
+        pub flags: SectionFlags,
         pub buf: Vec<u8>,
         pub relocs: Vec<Reloc>,
     }
 
     impl Section {
         pub fn new(name: Ident) -> Self {
-            let r#type = match name.as_str() {
-                _ if name.starts_with(".text") => SectionType::Text,
-                _ if name.starts_with(".data") => SectionType::Data,
-                _ if name.starts_with(".rodata") => SectionType::Rodata,
-                _ if name.starts_with(".bss") => SectionType::Bss,
-                _ => SectionType::Unknown,
+            let (flags, r#type) = match name.as_str() {
+                ".text" => (
+                    SectionFlags::ALLOCATABLE | SectionFlags::EXECUTABLE,
+                    SectionType::Progbits,
+                ),
+                ".bss" => (
+                    SectionFlags::WRITABLE | SectionFlags::ALLOCATABLE,
+                    SectionType::Nobits,
+                ),
+                ".data" => (
+                    SectionFlags::WRITABLE | SectionFlags::ALLOCATABLE,
+                    SectionType::Progbits,
+                ),
+                ".rodata" => (SectionFlags::ALLOCATABLE, SectionType::Progbits),
+                _ => (SectionFlags::empty(), SectionType::Progbits),
             };
 
             Self {
                 name,
                 r#type,
-                ..Default::default()
+                flags,
+                buf: Default::default(),
+                relocs: Default::default(),
             }
         }
     }
 
     impl Default for Section {
         fn default() -> Self {
-            Self {
-                name: ".text".into(),
-                r#type: Default::default(),
-                buf: Default::default(),
-                relocs: Default::default(),
-            }
+            Self::new(Ident::new_inline(".text"))
         }
     }
 
@@ -768,6 +780,8 @@ mod assembler {
 
         pub sections: Vec<Rc<RefCell<Section>>>,
         pub open_section: Rc<RefCell<Section>>,
+
+        pub active_options: HashSet<Ident>,
     }
 
     impl<'a> Assembler<'a> {
@@ -781,15 +795,17 @@ mod assembler {
 
                 sections: vec![open_section.clone()],
                 open_section,
+
+                active_options: HashSet::new(),
             }
         }
 
         fn consume_directive(&mut self, mut ident: Ident, mut exprs: Vec<Expr>) {
             macro_rules! extract_values {
                 ($($ty:ident),+) => {
-                    $(match exprs.pop().unwrap() {
+                    $(match exprs.remove(0) {
                         Expr::$ty(arg0) => arg0,
-                        _ => panic!(),
+                        expr => panic!("unexpected expr {expr:?}"),
                     }),+
                 };
             }
@@ -804,7 +820,45 @@ mod assembler {
                 }
                 "string" | "asciz" => self.write(&extract_values!(String)),
 
-                "section" => self.emit_section(extract_values!(Symbol)),
+                "section" => {
+                    let name = extract_values!(Symbol);
+                    self.emit_section(name);
+
+                    if !exprs.is_empty() {
+                        match exprs.remove(0) {
+                            Expr::String(flags_str) => {
+                                let flags_str = String::from_utf8(flags_str)
+                                    .expect("valid section flags are: w a x");
+                                let mut flags = SectionFlags::empty();
+                                for c in flags_str.chars() {
+                                    match c {
+                                        'w' => flags |= SectionFlags::WRITABLE,
+                                        'a' => flags |= SectionFlags::ALLOCATABLE,
+                                        'x' => flags |= SectionFlags::EXECUTABLE,
+                                        _ => panic!("valid section flags are: w a x"),
+                                    }
+                                }
+
+                                let mut sec = self.open_section.borrow_mut();
+                                sec.flags = flags;
+
+                                if !exprs.is_empty() {
+                                    if let Expr::Symbol(mut r#type) = exprs.remove(0) {
+                                        r#type.make_mut().make_ascii_lowercase();
+                                        sec.r#type = match r#type.as_str().strip_prefix('@') {
+                                            Some("progbits") => SectionType::Progbits,
+                                            Some("nobits") => SectionType::Nobits,
+                                            r#type => panic!("unknown section type: {type:?}"),
+                                        };
+                                    } else {
+                                        panic!("invalid section type expression");
+                                    }
+                                }
+                            }
+                            expr => panic!("unexpected expr: {expr:?}"),
+                        };
+                    }
+                }
                 "text" => {
                     if !exprs.is_empty() {
                         panic!("subsections are not supported");
@@ -830,6 +884,32 @@ mod assembler {
 
                     self.emit_section(".bss".into())
                 }
+                "option" => {
+                    while let Some(option) = exprs.pop() {
+                        match option {
+                            Expr::Symbol(mut ident) => {
+                                ident.make_mut().make_ascii_lowercase();
+                                match ident.as_str() {
+                                    // TODO: mark norvc/rvc as deprecated in favor of arch +/-c
+                                    // for some reason unknown to me, GAS doesn't allow arch -c
+                                    // and calls it deprecated, while the risc-v asm manual marks
+                                    // norvc as the deprecated alternative
+                                    "norvc" => {
+                                        self.active_options.insert(ident);
+                                    }
+                                    "rvc" => {
+                                        self.active_options.remove(&Ident::new_inline("norvc"));
+                                    }
+                                    "arch" => {
+                                        todo!();
+                                    }
+                                    opt => panic!("unknown option {opt:?}"),
+                                }
+                            }
+                            opt => panic!("unknown option {opt:?}"),
+                        }
+                    }
+                }
 
                 // "byte" => {
                 //     let v = extract_values!(Number);
@@ -846,7 +926,9 @@ mod assembler {
                 //     self.write(&val);
                 // }
                 _ => {}
-            };
+            }
+
+            assert!(exprs.is_empty(), "{exprs:?}");
         }
 
         fn emit_section(&mut self, name: Ident) {
